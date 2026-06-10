@@ -11,6 +11,7 @@ const state = {
   reviews: { page: 1 },
   cities: { page: 1 },
   unmapped: { page: 1 },
+  pipeline: { timer: null, configs: null },
   view: "overview",
 };
 
@@ -22,6 +23,7 @@ const VIEW_TITLES = {
   unmapped: ["Unmapped hotels", "Singletons with no cluster — find their closest clusters"],
   reviews: ["Review queue", "Prioritized clerical review items"],
   providers: ["Providers", "Feed quality and coverage"],
+  pipeline: ["Pipeline", "Download → normalize → match → cluster, end to end"],
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -169,6 +171,7 @@ function setView(name) {
   if (name === "unmapped") renderUnmapped();
   if (name === "reviews") renderReviews();
   if (name === "providers") renderProviders();
+  if (name === "pipeline") renderPipeline();
 }
 
 function kpiCard({ label, value, delta, deltaCls = "up", spark, sparkColor = C.indigo, hi = false }) {
@@ -313,7 +316,7 @@ async function renderClusters() {
         <div class="field"><label>Provider</label><select id="clusterProvider"><option value="">All</option></select></div>
         <div class="field"><label>Contact</label><select id="clusterContact"><option value="">All</option><option value="yes">Yes</option><option value="no">No</option></select></div>
         <div class="field"><label>Min size</label><input id="clusterMinSize" type="number" value="2" min="2"></div>
-        <div class="field"><label>Cluster ID</label><input id="clusterSearch" type="text" placeholder="US_… / IN_…"></div>
+        <div class="field"><label>Search</label><input id="clusterSearch" class="wide" type="text" placeholder="hotel name or cluster id…"></div>
         <button class="btn primary" id="clusterApply">Apply</button>
       </div>
       <div id="clusterTable" class="card table-card">${loading()}</div>
@@ -358,6 +361,7 @@ function clusterTable(data) {
   return `
     <div class="table-wrap"><table>
       <thead><tr>
+        <th>Hotel</th><th>City</th>
         ${clusterTh("cluster_size", "Size")}
         ${clusterTh("provider_count", "Prov")}
         <th>Status</th><th>Evidence</th>
@@ -367,6 +371,8 @@ function clusterTable(data) {
       </tr></thead>
       <tbody>${data.clusters.map((c) => `
         <tr class="clickable" data-cluster="${esc(c.cluster_id)}">
+          <td title="${esc(c.rep_name)}">${esc(trunc(c.rep_name, 44))}</td>
+          <td>${esc(trunc(c.city, 20))}</td>
           <td class="num">${fmt(c.cluster_size)}</td>
           <td class="num">${fmt(c.provider_count)}</td>
           <td>${tag(c.cluster_status === "auto_accept" ? "auto" : "review", c.cluster_status === "auto_accept" ? "auto" : "review")}</td>
@@ -1056,6 +1062,102 @@ function closeDrawer() {
   $("#overlay").classList.remove("open");
   $("#drawer").classList.remove("open");
   $("#drawer").setAttribute("aria-hidden", "true");
+}
+
+/* ---------------- pipeline ---------------- */
+
+async function renderPipeline() {
+  const el = $("#pipeline");
+  if (!el.dataset.ready) {
+    el.innerHTML = `
+      <div class="filterbar">
+        <div class="field"><label>Country</label><select id="pipeCountry"></select></div>
+        <div class="field"><label>Source data</label>
+          <select id="pipeSkipDownload">
+            <option value="1">Use existing raw files</option>
+            <option value="0">Download fresh from gateway</option>
+          </select>
+        </div>
+        <button class="btn primary" id="pipeRun">Run pipeline</button>
+      </div>
+      <div class="card" id="pipeStatus">${loading()}</div>
+      <div class="card table-card" style="margin-top:14px">
+        <pre id="pipeLog" class="mono" style="margin:0;padding:14px;max-height:420px;overflow:auto;font-size:12px;line-height:1.5;white-space:pre-wrap"></pre>
+      </div>
+    `;
+    state.pipeline.configs = await api("/api/pipeline/configs");
+    const cfgs = state.pipeline.configs;
+    $("#pipeCountry").innerHTML = cfgs.countries.map((c) =>
+      `<option value="${esc(c.country)}">${esc(c.country)} (${esc(c.config)})${c.has_raw ? "" : " — no raw data"}</option>`).join("");
+    if (!cfgs.download_key_present) {
+      $("#pipeSkipDownload").querySelector('option[value="0"]').disabled = true;
+      $("#pipeSkipDownload").title = "EMBEDDING_GATEWAY_API_KEY not set in server env";
+    }
+    $("#pipeRun").addEventListener("click", startPipeline);
+    el.dataset.ready = "1";
+  }
+  await refreshPipeline();
+}
+
+async function startPipeline() {
+  const country = $("#pipeCountry").value;
+  const skip = $("#pipeSkipDownload").value;
+  $("#pipeRun").disabled = true;
+  try {
+    await api(`/api/pipeline/start?country=${encodeURIComponent(country)}&skip_download=${skip}`);
+  } catch (err) {
+    $("#pipeStatus").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    $("#pipeRun").disabled = false;
+    return;
+  }
+  await refreshPipeline();
+}
+
+async function refreshPipeline() {
+  let s;
+  try { s = await api("/api/pipeline/status"); }
+  catch (err) { $("#pipeStatus").innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+  renderPipelineStatus(s);
+  clearTimeout(state.pipeline.timer);
+  if (s.running) {
+    const badge = $("#pipelineBadge");
+    badge.textContent = "▶"; badge.classList.add("show");
+    state.pipeline.timer = setTimeout(refreshPipeline, 2500);
+  } else {
+    $("#pipelineBadge").classList.remove("show");
+  }
+  if (state.view === "pipeline") $("#pipeRun").disabled = !!s.running;
+}
+
+function renderPipelineStatus(s) {
+  const box = $("#pipeStatus");
+  if (!box) return;
+  if (!s.country) {
+    box.innerHTML = `<div class="empty">No pipeline run yet this session — pick a country and hit Run.</div>`;
+    $("#pipeLog").textContent = "";
+    return;
+  }
+  const finished = !s.running && s.exit_code !== null && s.exit_code !== undefined;
+  const ok = finished && s.exit_code === 0;
+  const stateTag = s.running ? tag("running", "review")
+    : ok ? tag("done", "auto") : finished ? tag(`failed (exit ${s.exit_code})`, "risk") : tag("—");
+  box.innerHTML = `
+    <div class="meta-grid">
+      <div class="meta-item"><div class="ml">Country</div><div class="mv">${esc(s.country)}</div></div>
+      <div class="meta-item"><div class="ml">Status</div><div class="mv">${stateTag}</div></div>
+      <div class="meta-item"><div class="ml">Stage</div><div class="mv">${esc(s.stage || "starting…")}</div></div>
+      <div class="meta-item"><div class="ml">Download</div><div class="mv">${s.skip_download ? "skipped" : "fresh"}</div></div>
+    </div>
+    ${ok && s.run_id ? `<div style="margin-top:10px"><button class="btn primary" id="pipeSwitch">Open run ${esc(s.run_id)} →</button></div>` : ""}
+  `;
+  $("#pipeLog").textContent = (s.log_tail || []).join("\n");
+  const logEl = $("#pipeLog");
+  logEl.scrollTop = logEl.scrollHeight;
+  const sw = $("#pipeSwitch");
+  if (sw) sw.addEventListener("click", async () => {
+    await api(`/api/switch-run?run=${encodeURIComponent(s.run_id)}`);
+    location.reload();
+  });
 }
 
 /* ---------------- theme ---------------- */

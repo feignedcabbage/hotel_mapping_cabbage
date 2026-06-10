@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import subprocess
+import sys
 import threading
+import time
 from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -46,12 +50,12 @@ def latest_run() -> Path:
 def _version_tree(version: str) -> str:
     # v2_2 only changes clustering rules; its artifacts live in the splink_v2_1
     # tree with a _v2_2 file suffix (review queue in review_queue_v2_2/)
-    return "v2_1" if version in ("v2_2", "v2_3") else version
+    return "v2_1" if version in ("v2_2", "v2_3", "v2_4") else version
 
 
 def resolve_version(run: Path, version: str | None) -> str:
     """Pick the clustering version dir that actually has clusters."""
-    candidates = [version] if version else ["v2_3", "v2_2", "v2_1", "v2", "v1"]
+    candidates = [version] if version else ["v2_4", "v2_3", "v2_2", "v2_1", "v2", "v1"]
     for v in candidates:
         base = run / f"splink_{_version_tree(v)}" / "clusters"
         if not v or not base.is_dir():
@@ -198,6 +202,7 @@ def api_size_histogram() -> dict:
 
 
 def api_clusters(params: dict) -> dict:
+    ensure_city_tables()  # rep_name/city columns + name search table
     d = CFG["paths"]["diagnostics"]
     status = (params.get("status", [""])[0] or "").strip()
     provider = (params.get("provider", [""])[0] or "").strip()
@@ -235,8 +240,12 @@ def api_clusters(params: dict) -> dict:
         where.append("cluster_size >= ?")
         args.append(min_size)
     if search:
-        where.append("cluster_id ILIKE ?")
-        args.append(f"%{search}%")
+        # hotel name (any member) or cluster id
+        where.append(
+            "(cluster_id ILIKE ? OR cluster_id IN "
+            "(SELECT cluster_id FROM dashboard_cluster_names WHERE names ILIKE ?))"
+        )
+        args.extend([f"%{search}%", f"%{search}%"])
     where_sql = " AND ".join(where)
 
     total = q1(
@@ -245,15 +254,16 @@ def api_clusters(params: dict) -> dict:
     offset = (page - 1) * page_size
     rows = q(
         f"""
-        SELECT cluster_id, cluster_size, provider_count, providers_present,
-               round(max_geo_diameter_m, 1) AS max_geo_diameter_m,
-               round(min_edge_probability, 4) AS min_edge_probability,
-               round(dominant_name_signature_share, 3) AS dominant_name_signature_share,
-               has_contact_evidence, has_phone_edge, has_email_edge, has_domain_edge,
-               cluster_status, review_reasons, representative_record_id
-        FROM read_parquet('{d}')
-        WHERE {where_sql}
-        ORDER BY {sort_col} {direction}, cluster_id
+        SELECT d.cluster_id, d.cluster_size, d.provider_count, d.providers_present,
+               round(d.max_geo_diameter_m, 1) AS max_geo_diameter_m,
+               round(d.min_edge_probability, 4) AS min_edge_probability,
+               round(d.dominant_name_signature_share, 3) AS dominant_name_signature_share,
+               d.has_contact_evidence, d.has_phone_edge, d.has_email_edge, d.has_domain_edge,
+               d.cluster_status, d.review_reasons, d.representative_record_id,
+               c.rep_name, c.city
+        FROM (SELECT * FROM read_parquet('{d}') WHERE {where_sql}) d
+        LEFT JOIN dashboard_cluster_centroids c ON d.cluster_id = c.cluster_id
+        ORDER BY d.{sort_col} {direction}, d.cluster_id
         LIMIT ? OFFSET ?
         """,
         args + [page_size, offset],
@@ -675,6 +685,18 @@ def ensure_city_tables() -> None:
             GROUP BY mem.cluster_id
             """
         )
+        # all member names per cluster, for name search in the clusters view
+        con().execute(
+            f"""
+            CREATE OR REPLACE TEMP TABLE dashboard_cluster_names AS
+            SELECT mem.cluster_id,
+                   string_agg(DISTINCT h.property_name_norm, ' | ') AS names
+            FROM read_parquet('{m}') mem
+            JOIN read_parquet('{nh}') h USING (record_id)
+            WHERE mem.cluster_id IS NOT NULL
+            GROUP BY mem.cluster_id
+            """
+        )
         _CITY_TABLES_READY = True
 
 
@@ -811,6 +833,89 @@ def api_nearest_clusters(params: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Pipeline runner (download -> normalize -> ... -> review queue)
+# --------------------------------------------------------------------------- #
+PIPELINE_LOG_DIR = REPO_ROOT / "data" / "artifacts" / "pipeline_logs"
+_PIPE_LOCK = threading.Lock()
+_PIPE: dict = {"proc": None, "country": None, "log": None, "started": None,
+               "skip_download": None}
+
+
+def api_pipeline_configs(params: dict) -> dict:
+    from hotelmap.pipeline import country_configs
+
+    raw_dir = REPO_ROOT / "data" / "raw"
+    countries = []
+    for cc, cfg in sorted(country_configs().items()):
+        cdir = raw_dir / cc
+        has_raw = cdir.is_dir() and any(
+            f.stat().st_size > 0 for f in cdir.glob("*_property_info.ndjson")
+        )
+        countries.append({"country": cc, "config": cfg.name, "has_raw": has_raw})
+    return {
+        "countries": countries,
+        "download_key_present": bool(os.environ.get("EMBEDDING_GATEWAY_API_KEY")),
+    }
+
+
+def _pipeline_state() -> dict:
+    proc = _PIPE["proc"]
+    running = proc is not None and proc.poll() is None
+    state = {
+        "running": running,
+        "country": _PIPE["country"],
+        "skip_download": _PIPE["skip_download"],
+        "started": _PIPE["started"],
+        "exit_code": (proc.poll() if proc is not None else None),
+    }
+    log_path = _PIPE["log"]
+    if log_path and Path(log_path).exists():
+        lines = Path(log_path).read_text(errors="replace").splitlines()
+        state["log_tail"] = lines[-80:]
+        stages = [ln for ln in lines
+                  if ln.startswith("[pipeline] stage") and "stage done" not in ln]
+        state["stage"] = stages[-1].replace("[pipeline] stage ", "") if stages else None
+        done = [ln for ln in lines if ln.startswith("[pipeline] DONE run=")]
+        if done:
+            run_dir = Path(done[-1].split("run=", 1)[1].strip())
+            state["run_id"] = run_dir.name
+    return state
+
+
+def api_pipeline_start(params: dict) -> dict:
+    country = (params.get("country", [""])[0] or "").strip().upper()
+    skip_download = (params.get("skip_download", ["0"])[0] or "0").lower() in (
+        "1", "true", "yes")
+    from hotelmap.pipeline import country_configs
+
+    if country not in country_configs():
+        return {"error": f"no config for country {country!r}"}
+    if not skip_download and not os.environ.get("EMBEDDING_GATEWAY_API_KEY"):
+        return {"error": "EMBEDDING_GATEWAY_API_KEY not set in the dashboard's "
+                         "environment — enable 'use existing raw data' or restart "
+                         "the server with the key exported"}
+    with _PIPE_LOCK:
+        if _PIPE["proc"] is not None and _PIPE["proc"].poll() is None:
+            return {"error": f"pipeline already running for {_PIPE['country']}"}
+        PIPELINE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_path = PIPELINE_LOG_DIR / f"{time.strftime('%Y-%m-%d_%H%M%S')}_{country}.log"
+        cmd = [sys.executable, "-m", "hotelmap.pipeline", "--country", country]
+        if skip_download:
+            cmd.append("--skip-download")
+        log_fh = log_path.open("w")
+        proc = subprocess.Popen(
+            cmd, cwd=REPO_ROOT, stdout=log_fh, stderr=subprocess.STDOUT)
+        log_fh.close()
+        _PIPE.update(proc=proc, country=country, log=str(log_path),
+                     started=time.time(), skip_download=skip_download)
+    return {"ok": True, **_pipeline_state()}
+
+
+def api_pipeline_status(params: dict) -> dict:
+    return _pipeline_state()
+
+
+# --------------------------------------------------------------------------- #
 # Run switching (IN / NZ / US ...)
 # --------------------------------------------------------------------------- #
 def api_runs(params: dict) -> dict:
@@ -875,6 +980,9 @@ ROUTES = {
     "/api/city-clusters": api_city_clusters,
     "/api/unmapped": api_unmapped,
     "/api/nearest-clusters": api_nearest_clusters,
+    "/api/pipeline/configs": api_pipeline_configs,
+    "/api/pipeline/start": api_pipeline_start,
+    "/api/pipeline/status": api_pipeline_status,
 }
 
 
