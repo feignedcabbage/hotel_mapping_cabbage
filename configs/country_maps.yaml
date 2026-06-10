@@ -17,8 +17,7 @@ name_map:
   "united states of america": US
   "new zealand": NZ
 
-# Already-ISO2 values we accept as-is (uppercased).
-iso2_passthrough:
-  - IN
-  - US
-  - NZ
+# NOTE: any ISO2-shaped code (^[A-Z]{2}$) passes through automatically in
+# country.py — the old whitelist here made every NEW country resolve to 100%
+# null country_code_norm (zero blocking pairs). Numeric codes and country
+# names still resolve via the maps above; extend those as new feeds appear.

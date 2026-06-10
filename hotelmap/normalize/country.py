@@ -31,7 +31,6 @@ def normalize_country(lf: pl.LazyFrame, config: dict[str, Any]) -> pl.LazyFrame:
     cmaps = config.get("country_maps", {}) or {}
     numeric_map: dict[str, str] = {str(k): v for k, v in (cmaps.get("numeric_code_map") or {}).items()}
     name_map: dict[str, str] = {str(k).lower(): v for k, v in (cmaps.get("name_map") or {}).items()}
-    passthrough = [str(v).upper() for v in (cmaps.get("iso2_passthrough") or [])]
 
     iso2_providers = _iso2_providers(config)
 
@@ -46,8 +45,13 @@ def normalize_country(lf: pl.LazyFrame, config: dict[str, Any]) -> pl.LazyFrame:
     candidate_upper = candidate.str.to_uppercase()
 
     # Three resolution sources, each null when it doesn't apply.
+    # Any ISO2-shaped code passes through as-is (a hardcoded whitelist made every
+    # new country resolve to 100% null -> zero blocking pairs). Garbage values
+    # ('0', 'NAS', numerics) don't match the shape and fall to the other sources.
     pass_hit = (
-        pl.when(candidate_upper.is_in(passthrough)).then(candidate_upper).otherwise(None)
+        pl.when(candidate_upper.str.contains(r"^[A-Z]{2}$"))
+        .then(candidate_upper)
+        .otherwise(None)
     )
     numeric_hit = (
         candidate.replace_strict(numeric_map, default=None) if numeric_map else pl.lit(None, dtype=pl.Utf8)

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -841,12 +840,28 @@ _PIPE: dict = {"proc": None, "country": None, "log": None, "started": None,
                "skip_download": None}
 
 
-def api_pipeline_configs(params: dict) -> dict:
+def _country_configs() -> dict:
+    # the server may have been launched as `python hotelmap/dashboard/server.py`,
+    # where the repo root is not on sys.path and the package import would fail
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
     from hotelmap.pipeline import country_configs
 
+    return country_configs()
+
+
+def _gateway_key() -> str | None:
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from hotelmap.download import gateway_api_key
+
+    return gateway_api_key()
+
+
+def api_pipeline_configs(params: dict) -> dict:
     raw_dir = REPO_ROOT / "data" / "raw"
     countries = []
-    for cc, cfg in sorted(country_configs().items()):
+    for cc, cfg in sorted(_country_configs().items()):
         cdir = raw_dir / cc
         has_raw = cdir.is_dir() and any(
             f.stat().st_size > 0 for f in cdir.glob("*_property_info.ndjson")
@@ -854,7 +869,7 @@ def api_pipeline_configs(params: dict) -> dict:
         countries.append({"country": cc, "config": cfg.name, "has_raw": has_raw})
     return {
         "countries": countries,
-        "download_key_present": bool(os.environ.get("EMBEDDING_GATEWAY_API_KEY")),
+        "download_key_present": bool(_gateway_key()),
     }
 
 
@@ -886,14 +901,20 @@ def api_pipeline_start(params: dict) -> dict:
     country = (params.get("country", [""])[0] or "").strip().upper()
     skip_download = (params.get("skip_download", ["0"])[0] or "0").lower() in (
         "1", "true", "yes")
-    from hotelmap.pipeline import country_configs
-
-    if country not in country_configs():
-        return {"error": f"no config for country {country!r}"}
-    if not skip_download and not os.environ.get("EMBEDDING_GATEWAY_API_KEY"):
-        return {"error": "EMBEDDING_GATEWAY_API_KEY not set in the dashboard's "
-                         "environment — enable 'use existing raw data' or restart "
-                         "the server with the key exported"}
+    if not re.fullmatch(r"[A-Z]{2}", country):
+        return {"error": f"country must be a 2-letter ISO code, got {country!r}"}
+    if country not in _country_configs():
+        # new country: the pipeline auto-generates a generic config; it still
+        # needs raw data from somewhere
+        raw_dir = REPO_ROOT / "data" / "raw" / country
+        if skip_download and not any(raw_dir.glob("*_property_info.ndjson")):
+            return {"error": f"new country {country}: no raw files under "
+                             f"{raw_dir.relative_to(REPO_ROOT)} — choose "
+                             f"'Download fresh' (needs the gateway key)"}
+    if not skip_download and not _gateway_key():
+        return {"error": "no gateway key — put DB_API_KEY in .env at the repo "
+                         "root (or export EMBEDDING_GATEWAY_API_KEY), or use "
+                         "existing raw data"}
     with _PIPE_LOCK:
         if _PIPE["proc"] is not None and _PIPE["proc"].poll() is None:
             return {"error": f"pipeline already running for {_PIPE['country']}"}

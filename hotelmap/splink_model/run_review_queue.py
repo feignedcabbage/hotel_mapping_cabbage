@@ -562,7 +562,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--clusters-dir", default=None)
     p.add_argument("--gated", default=None)
     p.add_argument("--output-dir", default=None)
-    p.add_argument("--version", default=DEFAULT_VERSION, choices=["v2_1", "v2_2", "v2_3"])
+    p.add_argument("--version", default=DEFAULT_VERSION, choices=["v2_1", "v2_2", "v2_3", "v2_4"])
     args = p.parse_args(argv)
     run(args.normalized, args.clusters_dir, args.gated, args.output_dir, args.version)
     return 0

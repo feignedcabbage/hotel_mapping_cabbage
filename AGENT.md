@@ -38,13 +38,20 @@ looks like*. Update it as each stage lands.
   clustering **v2_3** (apartment building-level merge + villa-unit guard +
   franchise brand-conflict guard — see "Stage 09D-v2.3"). India still on v2_2
   artifacts; rerun with v2_3 when revisiting IN.
+- **Clustering v2_4 live for IN + NZ + US (2026-06-10):** name-subgroup
+  auto-SPLIT — cuts contact edges between conflicting core-token-signature
+  subgroups (geo-split chains, OYO/unit id conflicts, rare-token conflicts)
+  instead of routing to review. See "Stage 09D-v2.4". All runs have `*_v2_4`
+  cluster artifacts + `review_queue_v2_4/`; dashboard prefers v2_4.
 - Known next refinement candidates:
-  1. Tighten contact-only clustering further: small shared-phone/email clusters can still
+  1. Token geo-affinity ("local uniqueness"): use h3-level token stats (already
+     computed, unused) to weight disagreeing tokens by distance to the token's
+     geographic mass; separates binsar-class alien tokens from renamed listings.
+  2. Tighten contact-only clustering further: small shared-phone/email clusters can still
      represent multiple properties with shared back-office contacts.
-  2. Build survivorship/canonical records (09F), persistent canonical ID registry
+  3. Build survivorship/canonical records (09F), persistent canonical ID registry
      (09G), then incremental reruns (09H). Building-level clusters make this more
      urgent (clusters intentionally contain many unit listings).
-  3. Rerun India clustering as v2_3 (brand/villa/building logic is country-agnostic).
 
 Primary commands:
 
@@ -959,6 +966,178 @@ Review queue (`run_review_queue.py --version v2_3`) adds reasons
 `villa_unit_conflict` / `brand_conflict` (bucket contact_overmerge_risk,
 action split_cluster, +30 priority). Dashboard resolves v2_3 (maps to the
 splink_v2_1 tree) and prefers it by default.
+
+---
+
+## Stage 09D-v2.4 — name-subgroup auto-SPLIT (DONE 2026-06-10)
+
+Motivation (centroid-distance audit of IN auto clusters, 2026-06-10): contact
+edges (shared back-office phone/email) chained DIFFERENT properties of small
+chains into one auto cluster. The jaccard >= 0.30 contact floor passes via
+shared chain/rare tokens while the distinctive disagreeing tokens carry no
+weight: `kyzen` + `kyzen hitech your zenly` (two Hyderabad hotels 745m apart,
+one phone edge at jac 0.333), `club mahindra binsar` inside the `danish ooty`
+cluster (exact_email + wrong provider coords, 14m), `summit`/`summit gangtok`,
+`pamposh`/`pamposh gurgaon` (4.2km), whoopers hostels Anjuna/Manali/Palolem.
+
+Key design decision: **auto-split instead of review**. A false split is a
+missed mapping (recoverable in 09F/09G survivorship); a false merge is a wrong
+mapping (forbidden). So conflicting subgroups are SPLIT automatically and each
+coherent side stays auto-accepted — review is only for cases where neither
+keeping nor splitting is defensible.
+
+`run_clustering.py --version v2_4` (overlay on v2_3; same gated input): after
+the first union-find, components are decomposed into **core-token signature
+subgroups** and direct contact edges between conflicting subgroups are cut,
+then union-find reruns on surviving edges. Core tokens (NOT match tokens) are
+the subgroup key: match tokens strip city/area words (gurgaon, nubra, ooty),
+which erases exactly the suffix distinguishing branch properties. Signature-
+gated edges connect identical core signatures by construction, so cuts only
+ever remove contact edges. Artifact: `v2_4_split_log.parquet`.
+
+Conflict rules (constants at top of run_clustering.py):
+1. **geo_split**: both subgroups have >=2 located records, each tight
+   (spread < 150m), separated > 350m AND > 3x max spread. Single-record
+   subgroups NEVER geo-split — a lone far record is usually a bad geocode
+   (hotelbeds is systematically 1-6km off), not a second place. (First draft
+   without the >=2 rule cut 22,912 edges and pushed +13k records to
+   singletons; with it, cuts drop to 2,723 and singletons to +272.)
+2. **numeric_id_conflict**: both sides carry rare numeric ID tokens (OYO
+   property numbers) AND are separated (>350m, >2x spread). Co-located ID
+   conflicts (768 of 852 in IN) are rebrand/relistings of the SAME hotel and
+   stay merged.
+3. **rare_token_conflict**: both sides carry live rare alpha tokens
+   (doc_freq <= 300, len >= 4) the other lacks — fires regardless of geo
+   because the conflicting record often has wrong coords (binsar@Ooty).
+   Threshold 300 chosen because real places are not ultra-rare: binsar=139,
+   nubra=290; needs BOTH sides, so common-word variants can't fire.
+   IMPORTANT: unit codes like `100b`/`216c`/`5br` (regex `\d+[a-z]{0,2}`)
+   count as NUMERIC, not alpha — the US audit showed the geo-free alpha rule
+   tearing same-building `seaspray condos` units apart at 0m separation,
+   exactly what the v2_3 building policy wants merged. ID-shaped tokens must
+   always use the geo-gated numeric rule. (Same audit: apartment-style regex
+   was missing plural `condos` — fixed, US building merges +374.)
+
+Waivers (never conflict): misspelling twins (levenshtein <= 2: otty/ooty,
+cupids/cupid, theekana/theekaana) and containment twins (seacoin/coin,
+sproutsbodhivann/bodhivann, truncated numeric ids). A pair whose every
+disagreement is twin-waived is also exempt from geo_split (fern
+ranthambhore-class name noise with divergent geocodes stays merged).
+
+### Results (run 2026-06-09_005, v2_3 -> v2_4)
+- 1,041 conflict components, 2,723 edges cut (738 geo_split pairs, 176
+  numeric_id, 870 rare_token).
+- auto-accepted: **115,168 -> 115,840** (+672 clusters); records in auto
+  **453,409 -> 456,260** (+2,851) — splitting poisoned review clusters
+  (>10km diameter chains etc.) yields clean parts that auto-accept.
+- review: **11,057 -> 10,756** (-301); records in review -3,123.
+- singletons: +272 only. building_merged_auto 2,897 -> 2,920.
+- Review queue v2_4: 280,125 items (`review_queue_v2_4/`).
+
+Validation: kyzen -> two auto clusters (6+4) ✅; binsar record out of the ooty
+cluster (singleton; two real binsar clusters intact) ✅; `danish otty`
+misspelled hotelbeds record REJOINED the ooty cluster (recall recovered by the
+core-token fuzzy waiver) ✅; pamposh gurgaon own 4-record auto cluster ✅;
+shangrila nubra (7) split from tih shangrila ladakh (9) ✅; whoopers/lindsay/
+sonar-bangla multi-city chains split per city ✅; co-located OYO rebrands stay
+merged ✅.
+
+### NZ + US reruns (2026-06-10, same day)
+All three countries now share the v2_4 baseline; review queues rebuilt
+(`review_queue_v2_4/`: IN 280,125 / NZ 27,460 / US 885,506 items).
+- **NZ**: 76 components / 127 edges cut; auto 8,056 -> 8,091 clusters
+  (records 38,617 -> 38,775); review 174 -> 157; singletons +36.
+- **US**: 1,053 components / 10,080 edges cut (2,863 geo_split, 9,644
+  numeric_id — vacation-rental unit listings: SummitCove/Windsor/Bella Vida
+  units >350m apart are genuinely different properties — 1,198 rare_token);
+  auto 151,761 -> 152,352 clusters (records 674,507 -> 677,580); review
+  6,628 -> 6,379 (records -3,246); singletons +173; building_merged_auto
+  31,235 -> 31,609.
+
+Known residual tail: single-record-vs-single-record rare_token cuts at ~0m can
+split true matches with renamed listings (`jalore mansarovar` /
+`mansarovar rajasthan`) — recall-only cost, bounded. Future refinement =
+token geo-affinity ("local uniqueness"): use `name_token_stats_h3_8.parquet`
+(computed in stage 06 but unused by scoring) to weight a disagreeing token by
+the distance between the record and the token's geographic mass — separates
+binsar-class alien tokens from benign renamed listings, and would let scoring
+discount a rare token shared by multiple distinct nearby properties (kyzen).
+
+`run_review_queue.py` and the dashboard accept/prefer v2_4.
+
+---
+
+## Single-entry pipeline + dashboard runner + name search (DONE 2026-06-10)
+
+**`hotelmap/pipeline.py`** — one command runs everything for a country:
+```
+.venv/bin/python -m hotelmap.pipeline --country NZ [--skip-download]
+```
+Chains download (resumable; skips non-empty raw files) → normalize → splink
+scoring v2_1 → threshold v2_1 → clustering v2_4 → review queue v2_4. Stage
+versions are constants at the top (`SCORING_VERSION` / `CLUSTER_VERSION`) —
+bump there when baselines move. Country -> config resolved by scanning
+`configs/*.yaml` for a `country:` key, so a new country = one new yaml.
+Emits `[pipeline] stage <name>` lines and a final `[pipeline] DONE run=<dir>`
+(the dashboard parses these). Download logic moved to **`hotelmap/download.py`**
+(`download_country(cc)`); root `download_property_info.py` is now a thin
+wrapper. NDJSON download needs `EMBEDDING_GATEWAY_API_KEY` in env.
+Validated end-to-end on NZ (raw -> review queue ~20s, results match NZ_001).
+
+**Dashboard pipeline view** (`/api/pipeline/configs|start|status` + sidebar
+"Pipeline"): country dropdown (flags missing raw data), fresh-download vs
+use-existing-raw selector (download option disabled when the API key is absent
+from the server env), run button, live stage + log tail (2.5s poll), and an
+"Open run →" button on success that switches the dashboard to the new run.
+One job at a time (subprocess of `python -m hotelmap.pipeline`; logs under
+`data/artifacts/pipeline_logs/<ts>_<cc>.log`, gitignored dir).
+
+**New-country support (2026-06-10):** `--country XX` for ANY ISO2 code — if no
+config has that `country:`, `ensure_country_config()` writes a generic
+`configs/xx.yaml` from `GENERIC_CONFIG_TEMPLATE` (pipeline.py). The dashboard
+country field is free-text with a datalist of known configs and shows an
+"auto-generated config" hint for unknown codes. The generated config's header
+comments list what's degraded until hand-tuned:
+- no geo bbox -> wrong-country leak flags disabled (restel/cleartrip leak rows);
+- generic postal pattern (field-only, no address-text extraction) -> the
+  city+postal blocking rule is weak;
+- empty brand_tokens/brand_groups -> brand-conflict guard inert (springhill/
+  towneplace-class chain false merges possible) — promote candidates from
+  token_policy_generated.yaml after run 1;
+- no state_maps entry; no agoda/grnc numeric code in country_maps.yaml
+  (iso2 fallback covers agoda/grnc);
+- non-Latin scripts: ascii-fold + len-4 token thresholds are Latin-tuned;
+- providers may not use ISO2 in country_code for every country (e.g. 'UK' vs
+  'GB') -> download WHERE clause can miss rows; check counts after download.
+Validated: AU config generated, loads via load_config, postal regexes compile
+in polars + duckdb; clean error when --skip-download with no raw files.
+
+**First real new-country run (NP, 2026-06-10) found 3 latent bugs — all fixed:**
+1. `country_maps.yaml iso2_passthrough` was a hardcoded IN/US/NZ whitelist →
+   Nepal's perfectly valid `NP` codes resolved to NULL for 100% of records →
+   every blocking rule (all key on `country_code_norm`) produced ZERO pairs.
+   Fix: `country.py` now passes through any ISO2-shaped code (`^[A-Z]{2}$`);
+   garbage ('0', 'NAS', numerics) doesn't match the shape and still falls to
+   the numeric/name maps. The whitelist key is gone.
+2. Normalization guardrails reported FAIL (`country_norm_failure_rate=1.0`)
+   but nothing STOPPED — scoring ran on garbage and "succeeded" with 0 pairs.
+   Fix: `pipeline.py` reads diagnostics.json after normalize and aborts with
+   the failing guardrails when `guardrails_passed` is false (artifacts kept).
+3. Zero auto-match edges crashed v2_4 clustering: empty python list ->
+   `pl.Series` infers dtype Null -> `filter()` raises. Fix: explicit Boolean
+   dtype + explicit Utf8 schema on the union-find frames.
+NP results (23,892 records): 7.76M pairs scored, 3,798 auto clusters /
+16,656 records (69.7%), 53 review, 6,763 singletons, 200 building merges,
+0 off-target leaks. Generic-config caveat visible in practice: weak name cores
+("thamel", "arts", 5% empty) — locality words carry identity in Kathmandu;
+tune force_keep/location_descriptors before trusting NP deeply.
+
+**Cluster search by hotel name**: `/api/clusters?search=` now matches ANY
+member hotel name (new `dashboard_cluster_names` temp table: cluster_id ->
+string_agg of distinct member names) as well as cluster id; clusters table
+gained Hotel (rep_name) + City columns (LEFT JOIN dashboard_cluster_centroids;
+api_clusters now calls ensure_city_tables, so first hit pays the temp-table
+build like Cities/Unmapped). Searching "kyzen" surfaces all 4 kyzen clusters.
 
 ---
 

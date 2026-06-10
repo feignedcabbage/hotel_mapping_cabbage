@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import re
 from pathlib import Path
 
 import duckdb
@@ -46,6 +48,16 @@ BUILDING_MAX_DIAMETER_M = 250
 BUILDING_MAX_SIZE = 200
 BUILDING_TOP_TOKEN_SHARE = 0.8
 VILLA_SHARE_GUARD = 0.3
+# v2_4 auto-split: contact edges between conflicting name-signature subgroups are
+# CUT before components are finalized (split beats review: a false split is a
+# missed mapping, a false merge is a wrong one). Signature-gated edges only ever
+# connect identical match signatures, so cuts can never break a name-evidence link.
+SPLIT_MIN_SEP_M = 350        # subgroup centroid separation to call two places
+SPLIT_TIGHT_M = 150          # max subgroup spread for the geo-split rule
+SPLIT_RARE_DOC_FREQ = 300    # doc_freq cap for identity-bearing tokens (binsar=139,
+                             # nubra=290 are real places; needs BOTH sides to carry one)
+SPLIT_MIN_TOKEN_LEN = 4      # conflict evidence needs substantial tokens
+SPLIT_FUZZY_LEV = 2          # misspelling waiver (cupids/cupid, otty/ooty)
 AUTO_REASONS = ("signature", "phone", "exact_email", "non_reused_domain")
 CONTACT_REASONS = ("phone", "exact_email", "non_reused_domain")
 AUTO_MIN_PROB = 0.99
@@ -78,6 +90,189 @@ def _union_find(edges: pl.DataFrame) -> dict[str, str]:
     return {node: find(node) for node in parent}
 
 
+_ID_TOKEN = re.compile(r"\d+[a-z]{0,2}")
+
+
+def _lev_le(a: str, b: str, k: int = SPLIT_FUZZY_LEV) -> bool:
+    """Levenshtein(a, b) <= k with early exit (tokens are short)."""
+    if abs(len(a) - len(b)) > k:
+        return False
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[-1] + 1, prev[j - 1] + (ca != cb)))
+        if min(cur) > k:
+            return False
+        prev = cur
+    return prev[-1] <= k
+
+
+def _token_waived(tok: str, other: set[str]) -> bool:
+    """A disagreeing token is benign if the other side has a misspelling-distance
+    twin (theekana/theekaana) or a containment twin (seacoin/coin, truncated ids)."""
+    for o in other:
+        if _lev_le(tok, o):
+            return True
+        if len(tok) >= 4 and len(o) >= 4 and (tok in o or o in tok):
+            return True
+    return False
+
+
+def _apply_conflict_splits(
+    con: duckdb.DuckDBPyConnection, edges: pl.DataFrame, normalized: str
+) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
+    """v2_4: detect conflicting name subgroups inside each component and cut the
+    direct contact edges between them. Subgroups are keyed on CORE-token
+    signatures, not match signatures: match tokens strip city/area words
+    (gurgaon, nubra), which erases exactly the suffix that distinguishes branch
+    properties of one chain. Signature-gated edges connect identical core
+    signatures by construction, so cuts only ever remove contact edges.
+    Three conflict rules:
+      geo_split            both subgroups have >=2 located records, are geo-tight
+                           (<150m spread) but separated (>350m and >3x spread):
+                           two real, independently corroborated places chained by
+                           a shared back-office contact (kyzen / kyzen hitech).
+                           Single-record subgroups never geo-split: a lone far
+                           record is usually a bad geocode, not a second place.
+      numeric_id_conflict  both sides carry rare numeric ID tokens (OYO-style)
+                           AND are geo-separated; co-located ID conflicts are
+                           rebrand/relisting of the SAME hotel and stay merged.
+      rare_token_conflict  both sides carry rare alpha tokens the other lacks
+                           (binsar vs danish+ooty) — fires regardless of geo,
+                           because the conflicting record often has wrong coords.
+    Misspelling (lev<=2) and containment twins never count as conflicts; a pair
+    whose every disagreement is twin-waived is also exempt from geo_split.
+    """
+    rad = math.pi / 180
+
+    def hav(a: tuple[float, float], b: tuple[float, float]) -> float:
+        return 2 * 6371000.0 * math.asin(math.sqrt(
+            math.sin((a[0] - b[0]) * rad / 2) ** 2
+            + math.cos(a[0] * rad) * math.cos(b[0] * rad)
+            * math.sin((a[1] - b[1]) * rad / 2) ** 2))
+
+    roots0 = _union_find(edges)
+    uf0 = pl.DataFrame(
+        {"record_id": list(roots0.keys()), "root": list(roots0.values())},
+        schema={"record_id": pl.Utf8, "root": pl.Utf8},
+    )
+    con.register("uf0", uf0)
+    attrs = con.execute(
+        """
+        SELECT uf0.root, uf0.record_id,
+               array_to_string(list_sort(COALESCE(h.property_name_core_tokens, [])), ' ') AS msig,
+               COALESCE(h.property_name_core_tokens, []) AS mtoks,
+               h.lat_norm, h.lng_norm
+        FROM uf0 JOIN h ON uf0.record_id = h.record_id
+        """
+    ).pl()
+    con.unregister("uf0")
+    multi_roots = (
+        attrs.filter(pl.col("msig") != "")
+        .group_by("root").agg(pl.col("msig").n_unique().alias("k"))
+        .filter(pl.col("k") > 1)["root"]
+    )
+    run_dir = Path(normalized).parent
+    stats = pl.read_parquet(run_dir / "name_token_stats_global.parquet", columns=["token", "doc_freq"])
+    doc_freq = dict(zip(stats["token"], stats["doc_freq"]))
+
+    conflicts: set[tuple[str, str, str]] = set()  # (root, sig_lo, sig_hi)
+    log_rows = []
+    for (root,), grp in attrs.filter(pl.col("root").is_in(multi_roots)).group_by("root"):
+        groups: dict[str, dict] = {}
+        for r in grp.iter_rows(named=True):
+            if not r["msig"]:
+                continue
+            g = groups.setdefault(r["msig"], {"toks": set(), "pts": [], "n": 0})
+            g["toks"].update(r["mtoks"] or [])
+            g["n"] += 1
+            if r["lat_norm"] is not None and r["lng_norm"] is not None:
+                g["pts"].append((r["lat_norm"], r["lng_norm"]))
+        for g in groups.values():
+            if g["pts"]:
+                c = (sum(p[0] for p in g["pts"]) / len(g["pts"]),
+                     sum(p[1] for p in g["pts"]) / len(g["pts"]))
+                g["cent"], g["spread"] = c, max(hav(p, c) for p in g["pts"])
+            else:
+                g["cent"], g["spread"] = None, None
+        sigs = sorted(groups)
+        for i in range(len(sigs)):
+            for j in range(i + 1, len(sigs)):
+                sa, sb = sigs[i], sigs[j]
+                A, B = groups[sa], groups[sb]
+                ta, tb = A["toks"], B["toks"]
+                if not ta or not tb:
+                    continue
+                only_a, only_b = ta - tb, tb - ta
+                live_a = {t for t in only_a
+                          if len(t) >= SPLIT_MIN_TOKEN_LEN and not _token_waived(t, tb)}
+                live_b = {t for t in only_b
+                          if len(t) >= SPLIT_MIN_TOKEN_LEN and not _token_waived(t, ta)}
+                # pure spelling variants: never split, regardless of geo
+                if only_a and only_b and not live_a and not live_b:
+                    continue
+                rare_a = {t for t in live_a if doc_freq.get(t, 0) <= SPLIT_RARE_DOC_FREQ}
+                rare_b = {t for t in live_b if doc_freq.get(t, 0) <= SPLIT_RARE_DOC_FREQ}
+                # unit codes like 100b/216c/5br are IDs, not names: they must use
+                # the geo-gated numeric rule, or same-building condo units would
+                # be torn apart at 0m by the geo-free alpha rule.
+                alpha_a = {t for t in rare_a if not _ID_TOKEN.fullmatch(t)}
+                alpha_b = {t for t in rare_b if not _ID_TOKEN.fullmatch(t)}
+                num_a = rare_a - alpha_a
+                num_b = rare_b - alpha_b
+                sep = (hav(A["cent"], B["cent"])
+                       if A["cent"] is not None and B["cent"] is not None else None)
+                max_spread = max(A["spread"] or 0, B["spread"] or 0, 1.0)
+                kind = None
+                if alpha_a and alpha_b:
+                    kind = "rare_token_conflict"
+                elif (num_a and num_b and sep is not None
+                      and sep > SPLIT_MIN_SEP_M and sep > 2 * max_spread):
+                    kind = "numeric_id_conflict"
+                elif (sep is not None and sep > SPLIT_MIN_SEP_M
+                      and len(A["pts"]) >= 2 and len(B["pts"]) >= 2
+                      and (A["spread"] or 0) < SPLIT_TIGHT_M
+                      and (B["spread"] or 0) < SPLIT_TIGHT_M
+                      and sep > 3 * max_spread):
+                    kind = "geo_split"
+                if kind:
+                    conflicts.add((root, sa, sb))
+                    log_rows.append({
+                        "root": root, "sig_a": sa, "sig_b": sb, "conflict_type": kind,
+                        "sep_m": round(sep) if sep is not None else None,
+                        "members_a": A["n"], "members_b": B["n"],
+                    })
+
+    rid2sig = dict(zip(attrs["record_id"], attrs["msig"]))
+    conflict_roots = {c[0] for c in conflicts}
+    keep = []
+    for l, r in zip(edges["record_id_l"].to_list(), edges["record_id_r"].to_list()):
+        root = roots0.get(l)
+        if root in conflict_roots:
+            sl, sr = rid2sig.get(l, ""), rid2sig.get(r, "")
+            if sl != sr and (root, *sorted((sl, sr))) in conflicts:
+                keep.append(False)
+                continue
+        keep.append(True)
+    # explicit dtype: an empty list infers Null and filter() rejects it
+    filtered = edges.filter(pl.Series(keep, dtype=pl.Boolean))
+    log = pl.DataFrame(
+        log_rows,
+        schema={"root": pl.Utf8, "sig_a": pl.Utf8, "sig_b": pl.Utf8, "conflict_type": pl.Utf8,
+                "sep_m": pl.Int64, "members_a": pl.Int64, "members_b": pl.Int64},
+    )
+    split_stats = {
+        "v2_4_components_scanned": int(multi_roots.len()),
+        "v2_4_conflict_components": len(conflict_roots),
+        "v2_4_cut_edges": int(edges.height - filtered.height),
+        "v2_4_conflict_pairs_by_type": (
+            log.group_by("conflict_type").len().sort("conflict_type").to_dicts() if log.height else []
+        ),
+    }
+    return filtered, log, split_stats
+
+
 def _contact_only_auto_count(edge_path: Path, accept_path: Path) -> int:
     if not edge_path.exists() or not accept_path.exists():
         return 0
@@ -98,7 +293,13 @@ def _contact_only_auto_count(edge_path: Path, accept_path: Path) -> int:
 
 
 def _write_cluster_delta(normalized: str, out: Path, summary: dict, version: str) -> None:
-    if version == "v2_3":
+    if version == "v2_4":
+        old_summary_path = out / "clustering_summary_v2_3.json"
+        old_edge_path = out / "cluster_edges_v2_3.parquet"
+        old_accept_path = out / "clusters_auto_accept_v2_3.parquet"
+        old_label, new_label = "v2_3", "v2_4"
+        delta_name = "v2_3_vs_v2_4_cluster_delta.parquet"
+    elif version == "v2_3":
         old_summary_path = out / "clustering_summary_v2_2.json"
         old_edge_path = out / "cluster_edges_v2_2.parquet"
         old_accept_path = out / "clusters_auto_accept_v2_2.parquet"
@@ -149,7 +350,7 @@ def _write_cluster_delta(normalized: str, out: Path, summary: dict, version: str
 
 def run(normalized: str, gated: str, out: Path, version: str, config_path: str) -> dict:
     out.mkdir(parents=True, exist_ok=True)
-    use_match_tokens = version in ("v2_1", "v2_2", "v2_3")
+    use_match_tokens = version in ("v2_1", "v2_2", "v2_3", "v2_4")
     cfg = load_config(config_path)
     country = str(cfg.get("country", "IN")).upper()
     # brand families (config `brand_groups:`): sub-brand tokens that are naming
@@ -174,7 +375,7 @@ def run(normalized: str, gated: str, out: Path, version: str, config_path: str) 
         con.execute("CREATE VIEW h AS SELECT * FROM _norm_source")
     else:
         con.execute(f"CREATE VIEW h AS SELECT * FROM read_parquet('{normalized}')")
-    suffix = {"v2": "", "v2_1": "_v2_1", "v2_2": "_v2_2", "v2_3": "_v2_3"}[version]
+    suffix = {"v2": "", "v2_1": "_v2_1", "v2_2": "_v2_2", "v2_3": "_v2_3", "v2_4": "_v2_4"}[version]
 
     reasons = ", ".join(f"'{r}'" for r in AUTO_REASONS)
     contact_safety = ""
@@ -205,12 +406,23 @@ def run(normalized: str, gated: str, out: Path, version: str, config_path: str) 
         {contact_safety}
         """
     ).pl()
+    print(f"[09D] auto-match edges: {edges.height:,}")
+    split_stats: dict = {}
+    if version == "v2_4":
+        edges, split_log, split_stats = _apply_conflict_splits(con, edges, normalized)
+        split_log.write_parquet(out / "v2_4_split_log.parquet")
+        print(
+            f"[09D] v2_4 split: {split_stats['v2_4_conflict_components']:,} components, "
+            f"{split_stats['v2_4_cut_edges']:,} edges cut"
+        )
     n_edges = edges.height
     con.register("auto_edges", edges)
-    print(f"[09D] auto-match edges: {n_edges:,}")
 
     roots = _union_find(edges)
-    uf = pl.DataFrame({"record_id": list(roots.keys()), "root": list(roots.values())})
+    uf = pl.DataFrame(
+        {"record_id": list(roots.keys()), "root": list(roots.values())},
+        schema={"record_id": pl.Utf8, "root": pl.Utf8},
+    )
     con.register("uf", uf)
     print(f"[09D] nodes in clusters: {uf.height:,}; components: {uf['root'].n_unique():,}")
 
@@ -364,7 +576,7 @@ def run(normalized: str, gated: str, out: Path, version: str, config_path: str) 
         r"""
         CREATE OR REPLACE TABLE unit_flags AS
         SELECT root, record_id,
-            (regexp_matches(name, '\b(apartment|apartments|apt|studio|bedroom|bedrooms|condo|penthouse|loft|residences)\b')
+            (regexp_matches(name, '\b(apartment|apartments|apt|studio|bedroom|bedrooms|condos?|penthouse|loft|residences)\b')
              OR COALESCE(property_type, '') IN ('apartment', 'aparthotel')) AS is_apartment_style,
             regexp_matches(name, '\bvillas?\b') AS is_villa_style,
             COALESCE(
@@ -480,12 +692,12 @@ def run(normalized: str, gated: str, out: Path, version: str, config_path: str) 
     # (catches different same-name hotels in different towns chained by contact).
     spd_review_sql = (
         "CASE WHEN same_provider_dup AND NOT benign_same_provider_dup THEN 'same_provider_duplicate' END"
-        if version in ("v2_2", "v2_3")
+        if version in ("v2_2", "v2_3", "v2_4")
         else "CASE WHEN same_provider_dup THEN 'same_provider_duplicate' END"
     )
     hard_geo_sql = (
         f"CASE WHEN max_geo_diameter_m > {HARD_DIAMETER_M} THEN 'geo_diameter_gt_10km' END,"
-        if version in ("v2_2", "v2_3")
+        if version in ("v2_2", "v2_3", "v2_4")
         else ""
     )
     con.execute(
@@ -505,7 +717,7 @@ def run(normalized: str, gated: str, out: Path, version: str, config_path: str) 
         FROM cluster_diag
         """
     )
-    if version == "v2_3":
+    if version in ("v2_3", "v2_4"):
         # Apartment building-level consolidation + numbered-villa guard.
         # building_merge: unit-heavy, geo-tight, one dominant building name token
         # -> the cluster IS the building; intra-provider unit dups, size and name
@@ -671,9 +883,10 @@ def run(normalized: str, gated: str, out: Path, version: str, config_path: str) 
         **{k: (int(v) if v is not None else 0) for k, v in agg.items()},
         "contact_only_auto_clusters": int(contact_only_auto),
         "top_review_reasons": review_reason_counts,
+        **split_stats,
     }
     (out / f"clustering_summary{suffix}.json").write_text(json.dumps(summary, indent=2, default=str))
-    if version in ("v2_1", "v2_2", "v2_3"):
+    if version in ("v2_1", "v2_2", "v2_3", "v2_4"):
         _write_cluster_delta(normalized, out, summary, version)
     print("[09D] summary:", json.dumps(summary, indent=2, default=str))
     return summary
@@ -684,7 +897,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--normalized", required=True)
     p.add_argument("--gated", required=True, help="gated_pairs.parquet from 09C")
     p.add_argument("--output-dir", default=None)
-    p.add_argument("--version", default="v2", choices=["v2", "v2_1", "v2_2", "v2_3"])
+    p.add_argument("--version", default="v2", choices=["v2", "v2_1", "v2_2", "v2_3", "v2_4"])
     p.add_argument("--config", default="configs/india.yaml")
     args = p.parse_args(argv)
     out = Path(args.output_dir) if args.output_dir else Path(args.gated).parent.parent / "clusters"

@@ -1071,7 +1071,11 @@ async function renderPipeline() {
   if (!el.dataset.ready) {
     el.innerHTML = `
       <div class="filterbar">
-        <div class="field"><label>Country</label><select id="pipeCountry"></select></div>
+        <div class="field"><label>Country (ISO2)</label>
+          <input id="pipeCountry" list="pipeCountryList" maxlength="2" placeholder="IN / AU / GB…"
+                 style="text-transform:uppercase;width:90px">
+          <datalist id="pipeCountryList"></datalist>
+        </div>
         <div class="field"><label>Source data</label>
           <select id="pipeSkipDownload">
             <option value="1">Use existing raw files</option>
@@ -1079,28 +1083,52 @@ async function renderPipeline() {
           </select>
         </div>
         <button class="btn primary" id="pipeRun">Run pipeline</button>
+        <span id="pipeCountryHint" class="faint" style="align-self:center"></span>
       </div>
       <div class="card" id="pipeStatus">${loading()}</div>
       <div class="card table-card" style="margin-top:14px">
         <pre id="pipeLog" class="mono" style="margin:0;padding:14px;max-height:420px;overflow:auto;font-size:12px;line-height:1.5;white-space:pre-wrap"></pre>
       </div>
     `;
-    state.pipeline.configs = await api("/api/pipeline/configs");
+    try {
+      state.pipeline.configs = await api("/api/pipeline/configs");
+    } catch (err) {
+      $("#pipeStatus").innerHTML = `<div class="empty">Pipeline API error: ${esc(err.message)} — restart the dashboard server to pick up new code.</div>`;
+      return;
+    }
     const cfgs = state.pipeline.configs;
-    $("#pipeCountry").innerHTML = cfgs.countries.map((c) =>
-      `<option value="${esc(c.country)}">${esc(c.country)} (${esc(c.config)})${c.has_raw ? "" : " — no raw data"}</option>`).join("");
+    $("#pipeCountryList").innerHTML = cfgs.countries.map((c) =>
+      `<option value="${esc(c.country)}">${esc(c.config)}${c.has_raw ? "" : " — no raw data"}</option>`).join("");
+    if (cfgs.countries.length) $("#pipeCountry").value = cfgs.countries[0].country;
     if (!cfgs.download_key_present) {
       $("#pipeSkipDownload").querySelector('option[value="0"]').disabled = true;
-      $("#pipeSkipDownload").title = "EMBEDDING_GATEWAY_API_KEY not set in server env";
+      $("#pipeSkipDownload").title = "no gateway key — put DB_API_KEY in .env at the repo root";
     }
+    $("#pipeCountry").addEventListener("input", updateCountryHint);
+    updateCountryHint();
     $("#pipeRun").addEventListener("click", startPipeline);
     el.dataset.ready = "1";
   }
   await refreshPipeline();
 }
 
+function updateCountryHint() {
+  const cc = $("#pipeCountry").value.trim().toUpperCase();
+  const known = (state.pipeline.configs?.countries || []).some((c) => c.country === cc);
+  const hint = $("#pipeCountryHint");
+  if (cc.length === 2 && !known) {
+    hint.textContent = `new country — a generic ${cc.toLowerCase()}.yaml config will be auto-generated (review its header notes after)`;
+  } else {
+    hint.textContent = "";
+  }
+}
+
 async function startPipeline() {
-  const country = $("#pipeCountry").value;
+  const country = $("#pipeCountry").value.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(country)) {
+    $("#pipeStatus").innerHTML = `<div class="empty">Enter a 2-letter ISO country code.</div>`;
+    return;
+  }
   const skip = $("#pipeSkipDownload").value;
   $("#pipeRun").disabled = true;
   try {
