@@ -1247,8 +1247,9 @@ sequential multi-country exports must not wipe each other) and singleton ids
 are country-prefixed (`IN_GH6-<md5>`), else singleton rows are unattributable.
 CLI: `python -m hotelmap.export.run_export --run <dir> [--dry-run]`; defaults
 v2_4 / splink_v2_1. Pipeline flag `--export-db` runs it after the review
-queue. NOT yet live-tested (no write key present) — first keyed run should be
-watched; the LIKE-where delete syntax is unverified against the write API.
+queue. Live-verified 2026-06-10: WRITE_API_KEY in .env (the key routes to
+db=demo_v5 server-side — WRITE_DB/USER/PASSWORD in .env are informational),
+LIKE-where scoped delete accepted, insert+delete round trip OK.
 Pipeline `--country` accepts a CSV (`IN,US,...`, no limit) and runs
 sequentially; a failed country is logged (`COUNTRY FAILED CC:`) and skipped,
 summary `ALL DONE (n/m, FAILED: ...)`, exit 1 if any failed. Dashboard run

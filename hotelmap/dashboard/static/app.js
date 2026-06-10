@@ -67,9 +67,11 @@ async function api(path) {
   const res = await fetch(path);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const data = await res.json();
+  if (data.no_data) return data; // pipeline-only mode: not an error
   if (data.error) throw new Error(data.error);
   return data;
 }
+function noData() { return !!state.overview?.no_data; }
 function tag(text, cls = "muted") { return `<span class="tag ${cls}">${esc(text)}</span>`; }
 function loading() { return `<div class="loading"><div class="spinner"></div><div>Loading</div></div>`; }
 function empty(msg) { return `<div class="empty">${esc(msg)}</div>`; }
@@ -158,6 +160,8 @@ function hbars(rows, labelKey, valueKey, color = C.indigo) {
 
 /* ---------------- shell ---------------- */
 
+const DATA_VIEWS = new Set(["clusters", "clusterDetail", "cities", "unmapped", "reviews", "providers"]);
+
 function setView(name) {
   state.view = name;
   $$(".nav-item").forEach((b) => b.classList.toggle("active", b.dataset.view === (name === "clusterDetail" ? "clusters" : name)));
@@ -165,6 +169,10 @@ function setView(name) {
   const [t, s] = VIEW_TITLES[name] || ["", ""];
   $("#pageTitle").textContent = t;
   $("#pageSub").textContent = s;
+  if (noData() && DATA_VIEWS.has(name)) {
+    $(`#${name}`).innerHTML = empty("No run data yet — run a country from the Pipeline page first.");
+    return;
+  }
   if (name === "clusters") renderClusters();
   if (name === "clusterDetail") renderClusterDetailPage();
   if (name === "cities") renderCities();
@@ -1253,9 +1261,35 @@ function setTheme(theme) {
 
 /* ---------------- boot ---------------- */
 
+function renderNoData() {
+  const cfgs = state.pipeline.configs;
+  const hint = cfgs && !cfgs.download_key_present
+    ? `<div class="faint" style="margin-top:10px">heads up: no gateway key found — put <span class="mono">DB_API_KEY</span> in <span class="mono">.env</span> to download fresh data</div>`
+    : "";
+  $("#overview").innerHTML = `
+    <div class="card" style="text-align:center;padding:54px 24px">
+      <div style="font-size:34px;margin-bottom:12px">🗺️</div>
+      <h2 style="margin:0 0 8px">No mapping runs yet</h2>
+      <div class="faint" style="max-width:520px;margin:0 auto 20px">
+        Run the pipeline for a country to download, normalize, match and cluster
+        its hotels — the rest of the dashboard lights up after the first run finishes.
+      </div>
+      <button class="btn primary" id="gotoPipeline">Open the Pipeline page →</button>
+      ${hint}
+    </div>`;
+  $("#gotoPipeline").addEventListener("click", () => setView("pipeline"));
+}
+
 async function boot() {
   $("#overview").innerHTML = loading();
   state.overview = await api("/api/overview");
+  if (noData()) {
+    $("#pageSub").textContent = "no runs yet — pipeline-only mode";
+    $("#runSwitch").style.display = "none";
+    try { state.pipeline.configs = await api("/api/pipeline/configs"); } catch { /* shown on pipeline page */ }
+    renderNoData();
+    return;
+  }
   try { state.reviewSummary = await api("/api/review-summary"); } catch { state.reviewSummary = null; }
   const ov = state.overview;
   const c = ov.clustering || {};

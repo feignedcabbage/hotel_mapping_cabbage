@@ -39,9 +39,13 @@ _REVIEW_QUEUE_READY = False
 # --------------------------------------------------------------------------- #
 # Run / version resolution
 # --------------------------------------------------------------------------- #
-def latest_run() -> Path:
+def latest_run() -> Path | None:
     """Newest run that actually has clustering output — a run currently being
-    built by the pipeline must not break server startup."""
+    built by the pipeline must not break server startup. Returns None when no
+    completed runs exist yet (fresh checkout / empty runs dir): the server
+    then starts in pipeline-only mode instead of refusing to boot."""
+    if not RUNS_DIR.is_dir():
+        return None
     for p in sorted((p for p in RUNS_DIR.iterdir() if p.is_dir()), reverse=True):
         if not (p / "normalized_hotels.parquet").exists():
             continue
@@ -50,7 +54,7 @@ def latest_run() -> Path:
         except SystemExit:
             continue
         return p
-    raise SystemExit(f"No completed runs found under {RUNS_DIR}")
+    return None
 
 
 def _version_tree(version: str) -> str:
@@ -1038,6 +1042,8 @@ def api_pipeline_status(params: dict) -> dict:
 # --------------------------------------------------------------------------- #
 def api_runs(params: dict) -> dict:
     runs = []
+    if not RUNS_DIR.is_dir():
+        return {"runs": runs}
     for p in sorted(RUNS_DIR.iterdir()):
         if not (p / "normalized_hotels.parquet").exists():
             continue
@@ -1105,6 +1111,16 @@ ROUTES = {
     "/api/review-decisions-summary": api_review_decisions_summary,
 }
 
+# Routes that work without any run loaded (pipeline-only mode). Everything
+# else answers {"no_data": true} until a run exists and is switched to.
+NO_RUN_ROUTES = {
+    "/api/runs",
+    "/api/switch-run",
+    "/api/pipeline/configs",
+    "/api/pipeline/start",
+    "/api/pipeline/status",
+}
+
 
 # --------------------------------------------------------------------------- #
 # HTTP handler
@@ -1144,6 +1160,13 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         route = parsed.path
         try:
+            if (route.startswith("/api/") and CFG.get("run") is None
+                    and route not in NO_RUN_ROUTES):
+                return self._send_json({
+                    "no_data": True,
+                    "message": "no completed runs yet — start one from the "
+                               "Pipeline page",
+                })
             if route.startswith("/api/clusters/"):
                 cid = route[len("/api/clusters/"):]
                 return self._send_json(api_cluster_detail(cid))
@@ -1173,16 +1196,20 @@ def main():
     args = ap.parse_args()
 
     run = Path(args.run).resolve() if args.run else latest_run()
-    version = resolve_version(run, args.version)
-    CFG.update(
-        run=run,
-        version=version,
-        paths=cluster_paths(run, version),
-        review_paths=review_paths(run, version),
-    )
-
-    print(f"  run        : {run.relative_to(REPO_ROOT)}")
-    print(f"  version    : {version}")
+    if run is None:
+        CFG.update(run=None, version=None, paths=None, review_paths=None)
+        print("  run        : none yet — pipeline-only mode (start a country "
+              "from the Pipeline page)")
+    else:
+        version = resolve_version(run, args.version)
+        CFG.update(
+            run=run,
+            version=version,
+            paths=cluster_paths(run, version),
+            review_paths=review_paths(run, version),
+        )
+        print(f"  run        : {run.relative_to(REPO_ROOT)}")
+        print(f"  version    : {version}")
     print(f"  dashboard  : http://{args.host}:{args.port}")
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
