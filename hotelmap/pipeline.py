@@ -230,7 +230,7 @@ def _done(t0: float) -> None:
     print(f"[pipeline] stage done in {time.time() - t0:.1f}s", flush=True)
 
 
-def run_pipeline(country: str, skip_download: bool = False) -> Path:
+def run_pipeline(country: str, skip_download: bool = False, export_db: bool = False) -> Path:
     country = country.upper()
     if not re.fullmatch(r"[A-Z]{2}", country):
         raise SystemExit(f"country must be an ISO2 code, got {country!r}")
@@ -327,17 +327,54 @@ def run_pipeline(country: str, skip_download: bool = False) -> Path:
             f"review={s.get('review'):,} singletons={s.get('singleton_unmatched'):,}",
             flush=True,
         )
+
+    if export_db:
+        t = _stage("db export")
+        from hotelmap.export.run_export import export_to_db
+
+        export_to_db(run_dir, version=CLUSTER_VERSION)
+        _done(t)
+
     print(f"[pipeline] DONE run={run_dir}", flush=True)
     return run_dir
 
 
+def run_pipeline_multi(countries: list[str], skip_download: bool = False,
+                       export_db: bool = False) -> list[Path]:
+    """Run countries sequentially; a failed country is reported and skipped so an
+    overnight 10-country list doesn't die at #2."""
+    runs, failed = [], []
+    for i, cc in enumerate(countries, 1):
+        print(f"\n[pipeline] ===== country {i}/{len(countries)}: {cc.upper()} =====", flush=True)
+        try:
+            runs.append(run_pipeline(cc, skip_download=skip_download, export_db=export_db))
+        except SystemExit as e:
+            failed.append(cc.upper())
+            print(f"[pipeline] COUNTRY FAILED {cc.upper()}: {e}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            failed.append(cc.upper())
+            import traceback
+
+            traceback.print_exc()
+            print(f"[pipeline] COUNTRY FAILED {cc.upper()}: {type(e).__name__}: {e}", flush=True)
+    print(f"\n[pipeline] ALL DONE ({len(runs)}/{len(countries)} countries"
+          + (f", FAILED: {', '.join(failed)}" if failed else "") + ")", flush=True)
+    if failed:
+        raise SystemExit(1)
+    return runs
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="End-to-end hotel mapping pipeline")
-    p.add_argument("--country", required=True, help="ISO2 country, e.g. IN / NZ / US")
+    p.add_argument("--country", required=True,
+                   help="ISO2 country or comma-separated list, e.g. IN or IN,US,NZ")
     p.add_argument("--skip-download", action="store_true",
                    help="use existing data/raw/<country> files")
+    p.add_argument("--export-db", action="store_true",
+                   help="write results to the hotelmap DB after each country")
     args = p.parse_args(argv)
-    run_pipeline(args.country, skip_download=args.skip_download)
+    countries = [c.strip() for c in args.country.split(",") if c.strip()]
+    run_pipeline_multi(countries, skip_download=args.skip_download, export_db=args.export_db)
     return 0
 
 

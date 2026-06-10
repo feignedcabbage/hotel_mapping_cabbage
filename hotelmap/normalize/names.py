@@ -178,24 +178,53 @@ def build_city_overcommon_token_map(
     This catches city aliases in hotel names, e.g. many `kochi` records using
     `cochin` in the name. It is deliberately provider-coverage gated so a token that
     only repeats inside one feed is not stripped as local geography.
+
+    Record counts alone are NOT enough: one hotel listed by 13 providers in a
+    small town pushes its own brand tokens over the ratio (`ramada`/`wyndham`
+    in Kranjska Gora went "overcommon", emptied the match tokens, and left every
+    listing of the hotel an unmappable singleton). A genuine city alias appears
+    across many DISTINCT names, so we additionally require the token to occur in
+    >= `match_city_overcommon_min_distinct_signatures` different name signatures
+    within the city.
     """
     tcfg = config.get("tokens", {})
     min_ratio = tcfg.get("match_city_overcommon_ratio", 0.02)
     min_docs = tcfg.get("match_city_overcommon_min_doc_freq", 20)
     min_providers = tcfg.get("match_city_overcommon_min_provider_coverage", 4)
+    min_sigs = tcfg.get("match_city_overcommon_min_distinct_signatures", 10)
 
     city_counts = (
         df.filter(pl.col("city_name_norm").is_not_null())
         .group_by("city_name_norm")
         .agg(pl.len().alias("city_records"))
     )
+    # distinct-name key: the full sorted-token string where available (normalize
+    # path — signature isn't built yet), else the core signature (scoring path)
+    if "property_name_sorted_tokens" in df.columns:
+        key_col = pl.col("property_name_sorted_tokens")
+        if df.schema["property_name_sorted_tokens"] != pl.Utf8:
+            key_col = key_col.list.join(" ")
+    else:
+        key_col = pl.col("property_name_signature")
+    name_key = key_col.alias("_name_key")
+    sig_counts = (
+        df.filter(pl.col("city_name_norm").is_not_null())
+        .select("city_name_norm", name_key, "property_name_tokens")
+        .explode("property_name_tokens")
+        .rename({"property_name_tokens": "token"})
+        .drop_nulls("token")
+        .group_by("city_name_norm", "token")
+        .agg(pl.col("_name_key").n_unique().alias("distinct_signatures"))
+    )
     over = (
         token_stats["city"]
         .join(city_counts, on="city_name_norm", how="inner")
+        .join(sig_counts, on=["city_name_norm", "token"], how="left")
         .with_columns((pl.col("city_doc_freq") / pl.col("city_records")).alias("city_doc_freq_ratio"))
         .filter(pl.col("city_doc_freq") >= min_docs)
         .filter(pl.col("city_provider_coverage") >= min_providers)
         .filter(pl.col("city_doc_freq_ratio") >= min_ratio)
+        .filter(pl.col("distinct_signatures").fill_null(0) >= min_sigs)
         .group_by("city_name_norm")
         .agg(pl.col("token").alias("tokens"))
     )
@@ -306,6 +335,39 @@ def add_match_token_features(
         df = df.with_columns(
             pl.col("_property_name_match_tokens_base").alias("property_name_match_tokens")
         )
+
+    # Degenerate-name fallback: for names built ENTIRELY from weak/contextual/
+    # short tokens ("vila bled", "hotel city maribor", "cha cha rooms") the
+    # filtered set is empty, the name comparison goes NULL, and identical
+    # cross-provider listings become unmappable singletons. Fall back to the
+    # full name tokens (length>=2, non-numeric only): identical full names can
+    # still match exactly, while against normal filtered tokens the overlap is
+    # low — conservative in the right direction. Length 2 (not 3) is load-
+    # bearing: 'hotel GK palace' and 'hotel KC palace' are DIFFERENT Bhopal
+    # hotels — dropping the 2-char discriminator made both collapse to
+    # 'hotel palace' and auto-merge.
+    # Context (own city/state/country) tokens still leave the fallback:
+    # "by the lake apartments ohrid" must get the same signature as
+    # "by the lake apartments" listed by another provider in Ohrid.
+    # Two tiers: prefer also dropping generic type words so "hotel rio re"
+    # and "rio re" agree; if that empties the name (e.g. "apartments"),
+    # keep the type words rather than have nothing.
+    base_fallback = pl.col("property_name_tokens").list.eval(
+        pl.element().filter(
+            (pl.element().str.len_chars() >= 2)
+            & ~pl.element().str.contains(r"^[0-9]+$")
+        )
+    ).list.set_difference(context_tokens)
+    tier1 = base_fallback.list.set_difference(
+        pl.lit(match_low_value, dtype=pl.List(pl.Utf8))
+    )
+    fallback = pl.when(tier1.list.len() > 0).then(tier1).otherwise(base_fallback)
+    df = df.with_columns(
+        pl.when(pl.col("property_name_match_tokens").list.len() == 0)
+        .then(fallback)
+        .otherwise(pl.col("property_name_match_tokens"))
+        .alias("property_name_match_tokens")
+    )
 
     return df.with_columns(
         pl.col("property_name_match_tokens")

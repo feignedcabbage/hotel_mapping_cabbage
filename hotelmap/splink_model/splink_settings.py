@@ -59,6 +59,23 @@ BLOCKING_RULES = [
     ),
 ]
 
+# v2_1 adds blocking on the city-stripped MATCH signature: records whose name
+# carries a city suffix ("accommodation tanja ohrid") AND whose low-precision
+# coords land in a different h3_8 cell are invisible to BOTH the h3_8 rule and
+# the full-core-signature rule — their only same-hotel key is the match
+# signature. Keyed on h3_7 (~2.4km cells; tolerant of 2-decimal coords), NOT
+# city: city+match_sig blocks on generic fallback signatures in big US cities
+# blew scoring past 12GB (OOM).
+BLOCKING_RULES_V2_1 = BLOCKING_RULES + [
+    CustomRule(
+        "l.country_code_norm = r.country_code_norm "
+        "AND l.h3_7 = r.h3_7 "
+        "AND l.property_name_match_signature = r.property_name_match_signature "
+        "AND l.provider < r.provider",
+        sql_dialect=_DIALECT,
+    ),
+]
+
 
 def _comparisons() -> list:
     return [
@@ -125,10 +142,14 @@ def _name_comparison_v2_1() -> CustomComparison:
         comparison_description="strict match-token name agreement",
         comparison_levels=[
             cll.NullLevel("property_name_match_tokens"),
+            # TF-adjusted: an exact match on a RARE signature ("accommodation
+            # tanja") is far stronger evidence than on a common one — without
+            # this, low-precision-geo records can never reach the threshold on
+            # name alone, and generic shared names get overcredited.
             cll.CustomLevel(
                 "property_name_match_signature_l = property_name_match_signature_r",
                 "exact match-token signature",
-            ),
+            ).configure(tf_adjustment_column="property_name_match_signature"),
             cll.CustomLevel(f"{_MATCH_JAC} >= 0.85", "match-token jaccard >= 0.85"),
             cll.CustomLevel(f"{_MATCH_JAC} >= 0.65", "match-token jaccard >= 0.65"),
             cll.CustomLevel(f"{_MATCH_JAC} >= 0.45", "match-token jaccard >= 0.45"),
@@ -229,7 +250,7 @@ def build_settings_v2_1() -> SettingsCreator:
         link_type="dedupe_only",
         unique_id_column_name="record_id",
         comparisons=_comparisons_v2_1(),
-        blocking_rules_to_generate_predictions=BLOCKING_RULES,
+        blocking_rules_to_generate_predictions=BLOCKING_RULES_V2_1,
         retain_matching_columns=False,
         retain_intermediate_calculation_columns=False,
         additional_columns_to_retain=["provider"],

@@ -40,10 +40,17 @@ _REVIEW_QUEUE_READY = False
 # Run / version resolution
 # --------------------------------------------------------------------------- #
 def latest_run() -> Path:
-    runs = sorted(p for p in RUNS_DIR.iterdir() if p.is_dir())
-    if not runs:
-        raise SystemExit(f"No runs found under {RUNS_DIR}")
-    return runs[-1]
+    """Newest run that actually has clustering output — a run currently being
+    built by the pipeline must not break server startup."""
+    for p in sorted((p for p in RUNS_DIR.iterdir() if p.is_dir()), reverse=True):
+        if not (p / "normalized_hotels.parquet").exists():
+            continue
+        try:
+            resolve_version(p, None)
+        except SystemExit:
+            continue
+        return p
+    raise SystemExit(f"No completed runs found under {RUNS_DIR}")
 
 
 def _version_tree(version: str) -> str:
@@ -622,7 +629,8 @@ def api_review_detail(review_id: str) -> dict:
         """,
         [review_id],
     )
-    return {"meta": meta, "members": members, "edges": edges}
+    decision = load_decisions().get(review_id)
+    return {"meta": meta, "members": members, "edges": edges, "decision": decision}
 
 
 # --------------------------------------------------------------------------- #
@@ -832,6 +840,64 @@ def api_nearest_clusters(params: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Review decisions (run-scoped log; the persistent registry is 09G's job)
+# --------------------------------------------------------------------------- #
+DECISION_VALUES = ("same_hotel", "different_hotel",
+                   "same_property_group_not_same_hotel", "unclear")
+
+
+def _decisions_path() -> Path:
+    return Path(CFG["review_paths"]["dir"]) / "review_decisions.jsonl"
+
+
+def load_decisions() -> dict[str, dict]:
+    """Latest decision per review_id from the append-only log."""
+    path = _decisions_path()
+    out: dict[str, dict] = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            try:
+                d = json.loads(line)
+                out[d["review_id"]] = d
+            except Exception:  # noqa: BLE001
+                continue
+    return out
+
+
+def api_review_decision(params: dict) -> dict:
+    review_id = (params.get("review_id", [""])[0] or "").strip()
+    decision = (params.get("decision", [""])[0] or "").strip()
+    notes = (params.get("notes", [""])[0] or "").strip()
+    if not review_id:
+        return {"error": "review_id required"}
+    if decision not in DECISION_VALUES:
+        return {"error": f"decision must be one of {DECISION_VALUES}"}
+    rec = {
+        "review_id": review_id,
+        "decision": decision,
+        "notes": notes or None,
+        "reviewer": "dashboard",
+        "reviewed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "run_id": CFG["run"].name,
+        "version": CFG["version"],
+    }
+    path = _decisions_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _DB_LOCK:
+        with path.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    return {"ok": True, "decision": rec}
+
+
+def api_review_decisions_summary(params: dict) -> dict:
+    decisions = load_decisions()
+    counts: dict[str, int] = {}
+    for d in decisions.values():
+        counts[d["decision"]] = counts.get(d["decision"], 0) + 1
+    return {"total": len(decisions), "by_decision": counts}
+
+
+# --------------------------------------------------------------------------- #
 # Pipeline runner (download -> normalize -> ... -> review queue)
 # --------------------------------------------------------------------------- #
 PIPELINE_LOG_DIR = REPO_ROOT / "data" / "artifacts" / "pipeline_logs"
@@ -858,6 +924,14 @@ def _gateway_key() -> str | None:
     return gateway_api_key()
 
 
+def _write_key() -> str | None:
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from hotelmap.export.run_export import write_api_key
+
+    return write_api_key()
+
+
 def api_pipeline_configs(params: dict) -> dict:
     raw_dir = REPO_ROOT / "data" / "raw"
     countries = []
@@ -870,6 +944,7 @@ def api_pipeline_configs(params: dict) -> dict:
     return {
         "countries": countries,
         "download_key_present": bool(_gateway_key()),
+        "write_key_present": bool(_write_key()),
     }
 
 
@@ -889,45 +964,67 @@ def _pipeline_state() -> dict:
         state["log_tail"] = lines[-80:]
         stages = [ln for ln in lines
                   if ln.startswith("[pipeline] stage") and "stage done" not in ln]
-        state["stage"] = stages[-1].replace("[pipeline] stage ", "") if stages else None
+        stage = stages[-1].replace("[pipeline] stage ", "") if stages else None
+        markers = [ln for ln in lines if ln.startswith("[pipeline] ===== country")]
+        if markers and stage:
+            # "===== country 2/3: US =====" -> "US 2/3 · <stage>"
+            m = markers[-1].replace("[pipeline] ===== country ", "").rstrip(" =")
+            idx, _, cc = m.partition(": ")
+            stage = f"{cc} {idx} · {stage}"
+        state["stage"] = stage
         done = [ln for ln in lines if ln.startswith("[pipeline] DONE run=")]
+        state["run_ids"] = [Path(ln.split("run=", 1)[1].strip()).name for ln in done]
         if done:
-            run_dir = Path(done[-1].split("run=", 1)[1].strip())
-            state["run_id"] = run_dir.name
+            state["run_id"] = state["run_ids"][-1]
     return state
 
 
 def api_pipeline_start(params: dict) -> dict:
-    country = (params.get("country", [""])[0] or "").strip().upper()
+    raw_value = (params.get("country", [""])[0] or "").strip().upper()
+    countries = [c.strip() for c in raw_value.split(",") if c.strip()]
     skip_download = (params.get("skip_download", ["0"])[0] or "0").lower() in (
         "1", "true", "yes")
-    if not re.fullmatch(r"[A-Z]{2}", country):
-        return {"error": f"country must be a 2-letter ISO code, got {country!r}"}
-    if country not in _country_configs():
-        # new country: the pipeline auto-generates a generic config; it still
-        # needs raw data from somewhere
-        raw_dir = REPO_ROOT / "data" / "raw" / country
-        if skip_download and not any(raw_dir.glob("*_property_info.ndjson")):
-            return {"error": f"new country {country}: no raw files under "
-                             f"{raw_dir.relative_to(REPO_ROOT)} — choose "
-                             f"'Download fresh' (needs the gateway key)"}
+    export_db = (params.get("export_db", ["0"])[0] or "0").lower() in (
+        "1", "true", "yes")
+    if not countries:
+        return {"error": "enter at least one 2-letter ISO country code"}
+    bad = [c for c in countries if not re.fullmatch(r"[A-Z]{2}", c)]
+    if bad:
+        return {"error": f"not 2-letter ISO codes: {', '.join(bad)}"}
+    known = _country_configs()
+    for country in countries:
+        if country not in known:
+            # new country: the pipeline auto-generates a generic config; it
+            # still needs raw data from somewhere
+            raw_dir = REPO_ROOT / "data" / "raw" / country
+            if skip_download and not any(raw_dir.glob("*_property_info.ndjson")):
+                return {"error": f"new country {country}: no raw files under "
+                                 f"{raw_dir.relative_to(REPO_ROOT)} — choose "
+                                 f"'Download fresh' (needs the gateway key)"}
     if not skip_download and not _gateway_key():
         return {"error": "no gateway key — put DB_API_KEY in .env at the repo "
                          "root (or export EMBEDDING_GATEWAY_API_KEY), or use "
                          "existing raw data"}
+    if export_db and not _write_key():
+        return {"error": "no write key — put WRITE_API_KEY in .env at the repo "
+                         "root to enable DB export, or untick it"}
+    country_arg = ",".join(countries)
     with _PIPE_LOCK:
         if _PIPE["proc"] is not None and _PIPE["proc"].poll() is None:
             return {"error": f"pipeline already running for {_PIPE['country']}"}
         PIPELINE_LOG_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = PIPELINE_LOG_DIR / f"{time.strftime('%Y-%m-%d_%H%M%S')}_{country}.log"
-        cmd = [sys.executable, "-m", "hotelmap.pipeline", "--country", country]
+        log_path = (PIPELINE_LOG_DIR
+                    / f"{time.strftime('%Y-%m-%d_%H%M%S')}_{'-'.join(countries)}.log")
+        cmd = [sys.executable, "-m", "hotelmap.pipeline", "--country", country_arg]
         if skip_download:
             cmd.append("--skip-download")
+        if export_db:
+            cmd.append("--export-db")
         log_fh = log_path.open("w")
         proc = subprocess.Popen(
             cmd, cwd=REPO_ROOT, stdout=log_fh, stderr=subprocess.STDOUT)
         log_fh.close()
-        _PIPE.update(proc=proc, country=country, log=str(log_path),
+        _PIPE.update(proc=proc, country=country_arg, log=str(log_path),
                      started=time.time(), skip_download=skip_download)
     return {"ok": True, **_pipeline_state()}
 
@@ -1004,6 +1101,8 @@ ROUTES = {
     "/api/pipeline/configs": api_pipeline_configs,
     "/api/pipeline/start": api_pipeline_start,
     "/api/pipeline/status": api_pipeline_status,
+    "/api/review-decision": api_review_decision,
+    "/api/review-decisions-summary": api_review_decisions_summary,
 }
 
 

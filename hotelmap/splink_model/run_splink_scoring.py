@@ -74,8 +74,9 @@ def _load_effective_policy(normalized: str, config_path: str) -> dict:
 
 def _match_token_frame(normalized: str, config_path: str) -> pl.DataFrame:
     cols = [
-        "record_id", "provider", "country_code_norm", "h3_8", "h3_9",
-        "lat_norm", "lng_norm", "property_name_norm", "property_name_core",
+        "record_id", "provider", "country_code_norm", "h3_7", "h3_8", "h3_9",
+        "lat_norm", "lng_norm", "lat_lng_low_precision",
+        "property_name_norm", "property_name_core",
         "property_name_tokens", "property_name_core_tokens", "property_name_blocking_tokens",
         "property_name_brand_tokens",
         "property_name_signature", "phone_last10_non_reused_list", "email_norm_list",
@@ -116,13 +117,25 @@ def _prep(
         source = f"read_parquet('{normalized}')"
         match_cols = ""
 
-    nullifs = ", ".join(f"NULLIF({c}, '') AS {c}" for c in _NULLIF_STR)
+    # 'unknown' is the property_type mapping's fallback sentinel, not a type:
+    # comparing it manufactures evidence both ways (unknown!=hotel reads as a
+    # mismatch ~12x against; unknown==unknown reads as agreement). NULL it.
+    nullifs = ", ".join(
+        f"NULLIF(NULLIF({c}, ''), 'unknown') AS {c}" if c == "property_type_norm"
+        else f"NULLIF({c}, '') AS {c}"
+        for c in _NULLIF_STR
+    )
     con.execute(
         f"""
         CREATE OR REPLACE TABLE prepped AS
         SELECT
-            record_id, provider, country_code_norm, h3_8, h3_9,
-            lat_norm, lng_norm,
+            record_id, provider, country_code_norm, h3_7, h3_8, h3_9,
+            -- 2-decimal coords are ~1km of fake precision: as a distance
+            -- comparison they manufacture NEGATIVE evidence against true
+            -- matches. NULL them (null distance level = neutral); h3/blocking
+            -- keys are unaffected.
+            CASE WHEN COALESCE(lat_lng_low_precision, FALSE) THEN NULL ELSE lat_norm END AS lat_norm,
+            CASE WHEN COALESCE(lat_lng_low_precision, FALSE) THEN NULL ELSE lng_norm END AS lng_norm,
             property_name_norm, property_name_core, property_name_blocking_tokens,
             -- empty core-token list -> NULL so the name comparison's null level fires
             CASE WHEN len(property_name_core_tokens) = 0 THEN NULL

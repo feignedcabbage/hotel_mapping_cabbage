@@ -131,9 +131,14 @@ def add_geo_features(lf: pl.LazyFrame, config: dict[str, Any]) -> pl.LazyFrame:
         pl.col("_geo").struct.field("h3_8").alias("h3_8"),
         pl.col("_geo").struct.field("h3_9").alias("h3_9"),
         pl.col("_geo").struct.field("precision_bucket").alias("coord_precision_bucket"),
-        (pl.col("_geo").struct.field("precision_bucket") == "suspicious_rounded").alias(
-            "lat_lng_low_precision"
-        ),
+        # low precision = fewer decimals than config `geo.min_decimal_places`
+        # (default 3). 2dp is ~±700m of fake precision — previously only
+        # whole-degree 'suspicious_rounded' coords were flagged, so 2dp records
+        # passed as located and tripped 300-500m geo guards.
+        pl.col("_geo").struct.field("precision_bucket").is_in(
+            ["suspicious_rounded"]
+            + [f"precision_{d}dp" for d in range(2, int(geo_cfg.get("min_decimal_places", 3)))]
+        ).alias("lat_lng_low_precision"),
     ).drop("_geo")
 
     return lf

@@ -1132,6 +1132,130 @@ NP results (23,892 records): 7.76M pairs scored, 3,798 auto clusters /
 ("thamel", "arts", 5% empty) — locality words carry identity in Kathmandu;
 tune force_keep/location_descriptors before trusting NP deeply.
 
+**Small-country recall audit (SI, 2026-06-10) — two match-token bugs fixed:**
+User observed many obviously-identical singletons in SI. Measured: 439 groups
+(1,509 records) of IDENTICAL full name + same city + <500m, cross-provider,
+ALL singletons ("ramada resort by wyndham kranjska gora" x13 providers).
+Root causes (both in `names.py` match-token construction; failures CASCADE:
+empty match tokens -> NULL name comparison -> EM never observes strong-name
+levels (the "m probability not trained" warnings) -> identical-name pairs
+score < 0.01 persist floor -> invisible):
+1. `build_city_overcommon_token_map` counted RECORDS: one 13-provider hotel in
+   a small town pushed its own brand tokens ('ramada','wyndham') over the 2%
+   city ratio -> stripped as "local geography". Fix: a true city alias appears
+   in many DISTINCT names — added `match_city_overcommon_min_distinct_
+   signatures` (default 10) gate. ('cochin' in Kochi still strips: hundreds of
+   distinct names. The distinct-name key falls back from sorted-token string to
+   core signature depending on pipeline stage — the normalize-path df has no
+   signature yet, and sorted_tokens there is a STRING not a list.)
+2. Degenerate names built ENTIRELY of weak/short/contextual tokens
+   ("vila bled", "hotel city maribor", "cha cha rooms") end up with EMPTY match
+   tokens. Per-token filtering cannot see combination identity. Fix: when the
+   filtered set is empty, fall back to full name tokens (len>=3, non-numeric).
+   Identical full names then hit the exact match-token-signature level; mixed
+   fallback-vs-filtered comparisons overlap weakly -> conservative direction.
+SI rerun (SI_002 replaced SI_001): singletons 7,337 -> 5,786 (-21%), auto
+4,095 -> 4,425 clusters; identical-name singleton groups 439/1,509 -> 79/163
+(-89%). Safety verified: the three DIFFERENT Maribor hotels ("hotel city
+maribor" / "b and b hotel maribor" / "hotel maribor and garden rooms", all
+core-collapsed to 'maribor') stayed in three separate clusters; v2_4 splits
+healthy; all EM name levels now train.
+NOTE: both fixes change the match-token frame for EVERY country — IN/NZ/US
+artifacts predate them and should be rerun for consistency (expect recall
+gains in small towns, no precision regression mechanism identified).
+
+**MK recall audit (2026-06-10, same day) — seven more fixes, traced from two
+user-reported clusters ("by the lake apartments" / "accommodation tanja",
+both Ohrid, with obviously-identical singletons left unmapped):**
+1. **Exact-sig pairs missing the 0.99 bar on weak-field noise**: identical
+   name, 0m apart, p=0.982 because property_type 'unknown' vs 'hotel'.
+   New auto-edge clause (run_clustering): gate 'signature' + sig_exact +
+   dist<=100m + prob>=0.95 (`SIG_EXACT_AUTO_*`).
+2. **'unknown' property_type is a sentinel, not a type** (21% of MK records):
+   comparing it manufactures evidence both ways. Now NULLed in scoring prep.
+3. **Fallback signatures keep city suffixes**: "by the lake apartments ohrid"
+   != "by the lake apartments". Fallback now subtracts the record's own
+   city/state/country context tokens (names.py).
+4. **TF adjustment on the exact match-token-signature level**
+   (splink_settings): exact match on a RARE signature now weighs more than on
+   a generic one; directionally safer at both ends.
+5. **New v2_1 blocking rule on the MATCH signature** (city+country+match_sig):
+   records whose name carries a city suffix AND whose coords land in another
+   h3 cell were invisible to every existing rule.
+6. **lat_lng_low_precision honored config min_decimal_places only on paper**:
+   flag fired solely on whole-degree coords; 2dp (~±700m) passed as located
+   and tripped the 300-500m geo guards. Flag now covers any precision below
+   `geo.min_decimal_places` (geo.py). Low-precision coords are NULLed in the
+   scoring distance comparison AND in clustering members/split-subgroup geo
+   (fake precision must not produce negative evidence or inflate diameters);
+   h3/blocking keys keep using them.
+7. **v2_4 sig+city adoption pass** (`_adopt_sig_city_singletons`): name-only
+   records (no geo, no contacts) score 0.1-0.7 forever — probability cannot
+   carry them. When EVERY clustered record with the same match signature +
+   city sits in ONE geo-tight (<=300m) component, the singleton is adopted via
+   a synthetic 'sig_city_adoption' edge (prob 0.95, sig_exact). Guards learned
+   the hard way: good-coords singletons must be within 300m (1km tolerance
+   flipped 67 clusters to geo-diameter review), same-provider adoptions are
+   skipped (tripped the SPD guard), cap 10/group.
+MK final: auto 1,582 clusters, review 12, singletons 2,477 -> 1,703 (-31%),
+497 adoptions, all four user-reported records mapped, zero new review noise.
+ALL countries rerun with the consolidated ruleset the same day.
+
+**Fragment consolidation + SM microstate session (2026-06-10, cont.):**
+- MK 'ajro rooms': ONE hotel split into TWO 2-record clusters (provider
+  geocode groups 156m apart; cross pairs <0.80 — distance evidence fades past
+  75m) which then blocked adoption ("two targets = ambiguous"). The adoption
+  pass now also MERGES sibling components: all components+singletons sharing
+  (match sig) whose good coords fit a 250m radius are one place
+  (`v2_4_sig_city_merges`). Merged same-provider fragments correctly land in
+  same_provider_duplicate review, not silent merge.
+- SM (San Marino, 365 records) exposed the microstate failure stack:
+  (1) EM on 365 records is GARBAGE — exact-sig identical-coords pairs scored
+  0.02; only 44/365 records clustered. The pass now BOOTSTRAPS clusters with
+  no edge-backed anchor: >=2 providers + exact match sig + good coords within
+  250m is sufficient evidence without any Splink score
+  (`v2_4_sig_city_bootstraps`).
+  (2) City labels are provider noise in microstates ('hotel rio re' at
+  IDENTICAL coords labeled san marino/acquaviva/dogana) — grouping is now
+  signature-FIRST; only geo-incoherent sigs (real multi-place names) fall
+  back to per-city subgroups.
+  (3) Fallback sigs differ on type words ("hotel rio re" vs "rio re") — the
+  fallback is now two-tier: prefer dropping default match-low-value type
+  words; keep them only if that empties the name.
+  SM result: 44 -> 290/365 records auto-mapped (12% -> 79%), singletons
+  321 -> 53, all 'rio re'/'antica colombaia' records in single clusters.
+- **OOM lesson:** the first match-sig blocking rule was keyed city+match_sig;
+  on US-scale data, generic fallback signatures within big cities blew
+  scoring past 12GB RSS — kernel OOM-killed the run. Re-keyed to
+  **h3_7+match_sig** (~2.4km cells, tolerant of 2-decimal coords, bounded
+  blocks). h3_7 added to scoring `prepped`.
+- Stage-rerun rule of thumb: scoring changes need full pipeline reruns;
+  clustering/adoption changes only need the cheap in-place
+  run_clustering+run_review_queue pass.
+
+**DB export (09F-write) + multi-country runs (2026-06-10):**
+`hotelmap/export/run_export.py` — write logic mirrored from
+hotel_mapping_modified: refreshes `tripgain_hotel_info_v6` (one row/cluster,
+first-non-null merge across members, representative first),
+`tripgain_hotel_mappings_v6` (one row/provider record, mapping_type
+auto/review, confidence = min_edge_probability), `cluster_summary_v6`
+(supplier_breakdown + members JSON) via the Embedding Gateway WRITE API
+(X-Write-API-Key; key = WRITE_API_KEY or EMBEDDING_GATEWAY_WRITE_API_KEY from
+env or .env). Deliberate divergences from the mirror: refresh is
+COUNTRY-scoped (`DELETE where tripgain_id LIKE 'CC\\_%'`, NOT delete-all —
+sequential multi-country exports must not wipe each other) and singleton ids
+are country-prefixed (`IN_GH6-<md5>`), else singleton rows are unattributable.
+CLI: `python -m hotelmap.export.run_export --run <dir> [--dry-run]`; defaults
+v2_4 / splink_v2_1. Pipeline flag `--export-db` runs it after the review
+queue. NOT yet live-tested (no write key present) — first keyed run should be
+watched; the LIKE-where delete syntax is unverified against the write API.
+Pipeline `--country` accepts a CSV (`IN,US,...`, no limit) and runs
+sequentially; a failed country is logged (`COUNTRY FAILED CC:`) and skipped,
+summary `ALL DONE (n/m, FAILED: ...)`, exit 1 if any failed. Dashboard run
+page: comma-separated country input, "write to DB" checkbox (disabled until
+WRITE_API_KEY exists), per-country stage display ("US 2/3 · scoring"), and an
+Open button per completed run. Verified end-to-end with SM,LU via the API.
+
 **Cluster search by hotel name**: `/api/clusters?search=` now matches ANY
 member hotel name (new `dashboard_cluster_names` temp table: cluster_id ->
 string_agg of distinct member names) as well as cluster id; clusters table

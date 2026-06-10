@@ -1,0 +1,155 @@
+# AUTO-GENERATED generic config for LC (2026-06-10) — usable, but review before
+# trusting results. Country-specific tuning still missing:
+#   - geo bbox: wrong-country leak flags (lat_lng_out_of_range) are DISABLED,
+#     so provider rows leaked from other countries are not caught (restel/
+#     cleartrip are known leakers). Add lat/lng bounds when known.
+#   - postal: generic permissive pattern, postal-field only (no address-text
+#     extraction — too collision-prone without a country format). The
+#     city+postal blocking rule is weaker until a real pattern is set.
+#   - brand_tokens / brand_groups: EMPTY — the brand-conflict clustering guard
+#     is inert. Promote candidates from token_policy_generated.yaml after the
+#     first run (curate; do not auto-apply).
+#   - state_maps.yaml has no entry for LC: state variants stay unmerged.
+#   - country_maps.yaml: if agoda/grnc use a numeric code for LC, add it;
+#     records fall back to country_code_iso2 meanwhile.
+#   - non-Latin-script countries: ascii folding + length-4 token thresholds
+#     are tuned for Latin names and may behave poorly.
+country: LC
+default_phone_region: LC
+
+paths:
+  raw_dir: data/raw/LC
+  output_dir: data/artifacts/runs
+
+providers:
+  - agoda
+  - cleartrip
+  - expedia
+  - gogobal
+  - grnc
+  - hotelbeds
+  - ioxl
+  - ratehawk
+  - restel
+  - rezlive
+  - tbo
+  - tripjack
+  - veturis
+
+geo:
+  h3_resolutions: [7, 8, 9]
+  geohash_precisions: [5, 6, 7]
+  min_decimal_places: 3
+
+postal:
+  # permissive generic: 3-10 char alphanumeric token from the postal FIELD only
+  field_pattern: "\\b([a-z0-9][a-z0-9 -]{1,8}[a-z0-9])\\b"
+  # never matches — address-text extraction needs a country-specific pattern
+  address_pattern: "([^\\s\\S])"
+  validation_pattern: "^[a-z0-9][a-z0-9 -]{1,8}[a-z0-9]$"
+
+address_abbreviations:
+  ave: avenue
+  blvd: boulevard
+  dr: drive
+  ln: lane
+  ct: court
+  pl: place
+  st: street
+  rd: road
+
+tokens:
+  min_token_length: 2
+  low_value_global_doc_freq_ratio: 0.005
+  low_value_min_city_coverage: 10
+  low_value_min_provider_coverage: 4
+  rare_global_max_doc_freq: 2
+  rare_global_min_length: 4
+  rare_city_min_doc_freq: 2
+  rare_city_max_doc_freq: 50
+  rare_city_min_length: 4
+  rare_city_max_cities: 50
+  brand_candidate_min_chain_count: 10
+  blocking_overcommon_ratio: 0.001
+  blocking_min_token_length: 4
+  match_global_overcommon_ratio: 0.01
+  match_city_overcommon_ratio: 0.02
+  match_city_overcommon_min_doc_freq: 20
+  match_city_overcommon_min_provider_coverage: 4
+  match_min_token_length: 4
+  match_area_identity_keep_max_doc_freq: 200
+
+manual_tokens:
+  force_low_value:
+    - hotel
+    - hotels
+    - room
+    - rooms
+    - stay
+    - stays
+    - the
+    - and
+  # franchise type-words: "X Inn" vs "X Suites" can be different co-located
+  # properties; keeping them in the core keeps signatures discriminative
+  force_keep:
+    - inn
+    - suites
+    - motel
+    - lodge
+  brand_tokens: []
+  location_descriptors:
+    - near
+    - opposite
+    - opp
+    - "off"
+
+reuse:
+  phone_reuse_min: 5
+  email_reuse_min: 5
+  domain_reuse_min: 20
+  top_n: 200
+
+generic_email_locals:
+  - info
+  - reservation
+  - reservations
+  - booking
+  - bookings
+  - sales
+  - contact
+  - frontoffice
+  - frontdesk
+  - enquiry
+  - enquiries
+  - admin
+  - support
+  - stay
+  - hotel
+  - manager
+  - gm
+
+weak_domains:
+  - booking.com
+  - agoda.com
+  - expedia.com
+  - tboholidays.com
+  - tripadvisor.com
+  - hotels.com
+  - airbnb.com
+  - cleartrip.com
+  - worldota.net
+  - grnconnect.com
+  - travelocity.com
+  - orbitz.com
+  - priceline.com
+  - trivago.com
+  - marriott.com
+  - hilton.com
+  - ihg.com
+  - hyatt.com
+  - wyndhamhotels.com
+  - choicehotels.com
+  - bestwestern.com
+  - radissonhotels.com
+  - accor.com
+  - all.accor.com

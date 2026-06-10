@@ -61,6 +61,13 @@ SPLIT_FUZZY_LEV = 2          # misspelling waiver (cupids/cupid, otty/ooty)
 AUTO_REASONS = ("signature", "phone", "exact_email", "non_reused_domain")
 CONTACT_REASONS = ("phone", "exact_email", "non_reused_domain")
 AUTO_MIN_PROB = 0.99
+# Exact-signature pairs at 0m with sparse context fields (property_type
+# 'unknown', null postal/star) score 0.95-0.99 and miss the hard 0.99 bar even
+# though identity is perfect (MK 'accommodation tanja': p=0.982, jaccard 1.0,
+# dist 0). When the name signature matches exactly AND geo agrees tightly, the
+# probability tail is just weak-field noise.
+SIG_EXACT_AUTO_MIN_PROB = 0.95
+SIG_EXACT_AUTO_MAX_DIST_M = 100
 
 # representative preference (lower rank wins); not final survivorship
 PROVIDER_RANK = [
@@ -163,7 +170,8 @@ def _apply_conflict_splits(
         SELECT uf0.root, uf0.record_id,
                array_to_string(list_sort(COALESCE(h.property_name_core_tokens, [])), ' ') AS msig,
                COALESCE(h.property_name_core_tokens, []) AS mtoks,
-               h.lat_norm, h.lng_norm
+               CASE WHEN COALESCE(h.lat_lng_low_precision, FALSE) THEN NULL ELSE h.lat_norm END AS lat_norm,
+               CASE WHEN COALESCE(h.lat_lng_low_precision, FALSE) THEN NULL ELSE h.lng_norm END AS lng_norm
         FROM uf0 JOIN h ON uf0.record_id = h.record_id
         """
     ).pl()
@@ -273,6 +281,135 @@ def _apply_conflict_splits(
     return filtered, log, split_stats
 
 
+def _adopt_sig_city_singletons(
+    con: duckdb.DuckDBPyConnection, edges: pl.DataFrame
+) -> tuple[pl.DataFrame, dict]:
+    """v2_4: adopt name-anchored singletons into their unambiguous component.
+
+    Records with an exact match-token signature twin in the SAME city can still
+    score 0.1-0.7 when they have no usable geo (2-decimal coords) and no
+    contacts — probability alone never clears the bar (MK tripjack
+    'accommodation tanja ohrid'). But when EVERY clustered record with that
+    signature+city sits in ONE geo-tight component, the assignment is
+    unambiguous: adopt the singleton with a synthetic 'sig_city_adoption' edge.
+    Also CONSOLIDATES fragments: provider geocode groups for one hotel can sit
+    ~150m apart, splitting it into multiple small components whose cross pairs
+    score <0.80 (distance band evidence fades past 75m) — and the fragmentation
+    then blocks adoption ("two targets = ambiguous"). When EVERY good
+    coordinate across all components+singletons sharing (sig, city) fits in a
+    250m radius (so the 500m no-contact diameter guard keeps holding), it is
+    one place: merge the components and adopt the singletons.
+    Guards: a singleton's provider must not already be in the merged group
+    (same-provider adoption trips the SPD guard and a feed rarely
+    double-lists); at most 10 singleton adoptions per group; groups with no
+    located, clustered anchor are skipped.
+    """
+    rad = math.pi / 180
+
+    def hav(a, b):
+        return 2 * 6371000.0 * math.asin(math.sqrt(
+            math.sin((a[0] - b[0]) * rad / 2) ** 2
+            + math.cos(a[0] * rad) * math.cos(b[0] * rad)
+            * math.sin((a[1] - b[1]) * rad / 2) ** 2))
+
+    roots = _union_find(edges)
+    attrs = con.execute(
+        """
+        SELECT record_id, provider,
+               COALESCE(property_name_match_signature, '') AS msig,
+               city_name_norm AS city,
+               CASE WHEN COALESCE(lat_lng_low_precision, FALSE) THEN NULL ELSE lat_norm END AS lat,
+               CASE WHEN COALESCE(lat_lng_low_precision, FALSE) THEN NULL ELSE lng_norm END AS lng
+        FROM h
+        WHERE COALESCE(property_name_match_signature, '') <> ''
+          AND city_name_norm IS NOT NULL
+        """
+    ).pl()
+    attrs = attrs.with_columns(
+        pl.col("record_id").map_elements(lambda r: roots.get(r), return_dtype=pl.Utf8).alias("root")
+    )
+
+    rows = []
+    n_merges = n_adoptions = n_bootstraps = 0
+    # Group by signature FIRST: city labels are provider noise (San Marino's
+    # 'hotel rio re' is labeled san marino / acquaviva / dogana across feeds
+    # at identical coordinates). When every good coordinate for a signature
+    # fits one 250m spot, it is one place regardless of the city strings; only
+    # geo-incoherent signatures (real multi-city chains) fall back to per-city
+    # subgroups.
+    work: list[pl.DataFrame] = []
+    for (_msig,), sgrp in attrs.group_by(["msig"]):
+        pts = [(la, ln) for la, ln in zip(sgrp["lat"], sgrp["lng"]) if la is not None]
+        if pts:
+            c = (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+            if max(hav(p, c) for p in pts) <= 250:
+                work.append(sgrp)
+                continue
+        for _key, cgrp in sgrp.group_by(["city"]):
+            work.append(cgrp)
+    for grp in work:
+        crows = grp.filter(pl.col("root").is_not_null())
+        pts = [(la, ln) for la, ln in zip(grp["lat"], grp["lng"]) if la is not None]
+        if not pts:
+            continue
+        c = (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+        if max(hav(p, c) for p in pts) > 250:
+            continue  # not one place (or ambiguous) -> leave untouched
+        if crows.height == 0:
+            # BOOTSTRAP: no edge-backed anchor at all. On tiny countries EM is
+            # garbage (SM: 365 records, exact-sig pairs scoring 0.02) so whole
+            # same-hotel groups stay unclustered. The evidence here — exact
+            # match signature + same city + every good coordinate within 250m
+            # + cross-provider — is the same evidence the adoption path
+            # already trusts; it does not need a Splink score to exist.
+            if grp.height < 2 or grp["provider"].n_unique() < 2:
+                continue
+            anchor = grp.row(0, named=True)
+            n_bootstraps += 1
+            group_providers = {anchor["provider"]}
+        else:
+            anchor = crows.row(0, named=True)
+            group_providers = set(crows["provider"])
+        # merge sibling components (same sig+city, all within the footprint)
+        seen_roots = {anchor["root"]}
+        for r in crows.iter_rows(named=True):
+            if r["root"] in seen_roots:
+                continue
+            seen_roots.add(r["root"])
+            n_merges += 1
+            rows.append({
+                "record_id_l": anchor["record_id"], "record_id_r": r["record_id"],
+                "provider_l": anchor["provider"], "provider_r": r["provider"],
+                "match_probability": 0.95, "gate_reason": "sig_city_adoption",
+                "dist_m": None, "phone_ov": False,
+                "name_match_jaccard": 1.0, "sig_exact": True,
+            })
+        # adopt singletons
+        adopted = 0
+        for r in grp.filter(pl.col("root").is_null()).iter_rows(named=True):
+            if r["record_id"] == anchor["record_id"]:
+                continue  # bootstrap anchor is itself a singleton
+            if r["provider"] in group_providers:
+                continue  # same-provider adoption: trips SPD guard, likely a feed dup
+            adopted += 1
+            if adopted > 10:
+                break
+            n_adoptions += 1
+            rows.append({
+                "record_id_l": anchor["record_id"], "record_id_r": r["record_id"],
+                "provider_l": anchor["provider"], "provider_r": r["provider"],
+                "match_probability": 0.95, "gate_reason": "sig_city_adoption",
+                "dist_m": None, "phone_ov": False,
+                "name_match_jaccard": 1.0, "sig_exact": True,
+            })
+    stats = {"v2_4_sig_city_adoptions": n_adoptions, "v2_4_sig_city_merges": n_merges,
+             "v2_4_sig_city_bootstraps": n_bootstraps}
+    if rows:
+        adopt = pl.DataFrame(rows).select(edges.columns).cast(edges.schema)
+        edges = pl.concat([edges, adopt])
+    return edges, stats
+
+
 def _contact_only_auto_count(edge_path: Path, accept_path: Path) -> int:
     if not edge_path.exists() or not accept_path.exists():
         return 0
@@ -378,6 +515,15 @@ def run(normalized: str, gated: str, out: Path, version: str, config_path: str) 
     suffix = {"v2": "", "v2_1": "_v2_1", "v2_2": "_v2_2", "v2_3": "_v2_3", "v2_4": "_v2_4"}[version]
 
     reasons = ", ".join(f"'{r}'" for r in AUTO_REASONS)
+    sig_exact_auto = (
+        f"""
+            OR (gate_reason = 'signature' AND COALESCE(sig_exact, FALSE)
+                AND dist_m <= {SIG_EXACT_AUTO_MAX_DIST_M}
+                AND match_probability >= {SIG_EXACT_AUTO_MIN_PROB})
+        """
+        if use_match_tokens
+        else ""
+    )
     contact_safety = ""
     if use_match_tokens:
         contact_safety = """
@@ -402,7 +548,10 @@ def run(normalized: str, gated: str, out: Path, version: str, config_path: str) 
                gate_reason, dist_m, phone_ov,
                {edge_extra_cols}
         FROM gated
-        WHERE gate_reason IN ({reasons}) AND match_probability >= {AUTO_MIN_PROB}
+        WHERE (
+            (gate_reason IN ({reasons}) AND match_probability >= {AUTO_MIN_PROB})
+            {sig_exact_auto}
+        )
         {contact_safety}
         """
     ).pl()
@@ -414,6 +563,12 @@ def run(normalized: str, gated: str, out: Path, version: str, config_path: str) 
         print(
             f"[09D] v2_4 split: {split_stats['v2_4_conflict_components']:,} components, "
             f"{split_stats['v2_4_cut_edges']:,} edges cut"
+        )
+        edges, adopt_stats = _adopt_sig_city_singletons(con, edges)
+        split_stats.update(adopt_stats)
+        print(
+            f"[09D] v2_4 sig+city adoptions: {adopt_stats['v2_4_sig_city_adoptions']:,}, "
+            f"fragment merges: {adopt_stats['v2_4_sig_city_merges']:,}"
         )
     n_edges = edges.height
     con.register("auto_edges", edges)
@@ -438,7 +593,11 @@ def run(normalized: str, gated: str, out: Path, version: str, config_path: str) 
         CREATE OR REPLACE TABLE members AS
         SELECT uf.record_id, uf.root, h.provider, h.property_name_signature AS sig,
                {match_cols}
-               h.property_name_norm AS name, h.lat_norm, h.lng_norm,
+               h.property_name_norm AS name,
+               -- 2-decimal coords are ~1km of fake precision; letting them into
+               -- diameters/centroids trips geo guardrails on true clusters
+               CASE WHEN COALESCE(h.lat_lng_low_precision, FALSE) THEN NULL ELSE h.lat_norm END AS lat_norm,
+               CASE WHEN COALESCE(h.lat_lng_low_precision, FALSE) THEN NULL ELSE h.lng_norm END AS lng_norm,
                h.property_type_norm AS property_type,
                h.property_name_brand_tokens AS brand_tokens,
                CASE {rank_case} ELSE 99 END AS prov_rank

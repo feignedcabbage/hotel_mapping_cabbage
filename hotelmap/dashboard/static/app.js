@@ -263,6 +263,7 @@ async function renderOverview() {
         ])}
         ${c.building_merged_auto ? `<div class="rate-row"><span class="rl">Building-level clusters</span><span class="rv">${fmt(c.building_merged_auto)}</span></div>` : ""}
         ${c.largest_cluster_size ? `<div class="rate-row"><span class="rl">Largest cluster</span><span class="rv">${fmt(c.largest_cluster_size)}</span></div>` : ""}
+        ${c.v2_4_conflict_components ? `<div class="rate-row"><span class="rl">Auto-split components (v2.4)</span><span class="rv">${fmt(c.v2_4_conflict_components)} · ${fmt(c.v2_4_cut_edges)} edges cut</span></div>` : ""}
       </div>
     </div>
 
@@ -1005,6 +1006,43 @@ async function openReview(reviewId) {
   openDrawer("Review item", reviewId, loading());
   const data = await api(`/api/review-queue/${encodeURIComponent(reviewId)}`);
   openDrawer("Review item", reviewId, detailHtml(data));
+  bindDecisionBar(reviewId);
+}
+
+const DECISIONS = [
+  ["same_hotel", "Same hotel", "auto"],
+  ["different_hotel", "Different", "risk"],
+  ["same_property_group_not_same_hotel", "Same group", "review"],
+  ["unclear", "Unclear", "muted"],
+];
+
+function decisionBar(decision) {
+  const current = decision?.decision;
+  return `
+    <div class="section-label">Decision${current ? ` — recorded ${esc(decision.reviewed_at || "")}` : ""}</div>
+    <div class="chip-row" id="decisionBar" style="gap:6px;margin-bottom:10px">
+      ${DECISIONS.map(([val, label, cls]) => `
+        <button class="btn small decision-btn ${current === val ? "primary" : ""}" data-decision="${val}">
+          ${current === val ? "✓ " : ""}${label}
+        </button>`).join("")}
+      <span id="decisionStatus" class="faint"></span>
+    </div>`;
+}
+
+function bindDecisionBar(reviewId) {
+  $$("#decisionBar .decision-btn").forEach((b) => b.addEventListener("click", async () => {
+    $("#decisionStatus").textContent = "saving…";
+    try {
+      await api(`/api/review-decision?review_id=${encodeURIComponent(reviewId)}&decision=${encodeURIComponent(b.dataset.decision)}`);
+      $$("#decisionBar .decision-btn").forEach((x) => {
+        x.classList.toggle("primary", x === b);
+        x.textContent = (x === b ? "✓ " : "") + x.textContent.replace(/^✓ /, "");
+      });
+      $("#decisionStatus").textContent = "saved";
+    } catch (err) {
+      $("#decisionStatus").textContent = `error: ${err.message}`;
+    }
+  }));
 }
 
 function detailHtml(data) {
@@ -1012,6 +1050,7 @@ function detailHtml(data) {
   const members = data.members || [];
   const edges = data.edges || [];
   return `
+    ${decisionBar(data.decision)}
     <div class="meta-grid">
       <div class="meta-item"><div class="ml">Size</div><div class="mv">${fmt(m.cluster_size)}</div></div>
       <div class="meta-item"><div class="ml">Providers</div><div class="mv">${fmt(m.provider_count || new Set(members.map((x) => x.provider)).size)}</div></div>
@@ -1071,9 +1110,9 @@ async function renderPipeline() {
   if (!el.dataset.ready) {
     el.innerHTML = `
       <div class="filterbar">
-        <div class="field"><label>Country (ISO2)</label>
-          <input id="pipeCountry" list="pipeCountryList" maxlength="2" placeholder="IN / AU / GB…"
-                 style="text-transform:uppercase;width:90px">
+        <div class="field"><label>Countries (ISO2, comma-separated)</label>
+          <input id="pipeCountry" list="pipeCountryList" placeholder="IN or IN,US,NZ…"
+                 style="text-transform:uppercase;min-width:170px">
           <datalist id="pipeCountryList"></datalist>
         </div>
         <div class="field"><label>Source data</label>
@@ -1081,6 +1120,11 @@ async function renderPipeline() {
             <option value="1">Use existing raw files</option>
             <option value="0">Download fresh from gateway</option>
           </select>
+        </div>
+        <div class="field"><label>After each run</label>
+          <label style="display:flex;align-items:center;gap:7px;height:34px;cursor:pointer">
+            <input type="checkbox" id="pipeExportDb"> write to DB
+          </label>
         </div>
         <button class="btn primary" id="pipeRun">Run pipeline</button>
         <span id="pipeCountryHint" class="faint" style="align-self:center"></span>
@@ -1104,6 +1148,12 @@ async function renderPipeline() {
       $("#pipeSkipDownload").querySelector('option[value="0"]').disabled = true;
       $("#pipeSkipDownload").title = "no gateway key — put DB_API_KEY in .env at the repo root";
     }
+    if (!cfgs.write_key_present) {
+      const cb = $("#pipeExportDb");
+      cb.disabled = true;
+      cb.parentElement.title = "no write key — put WRITE_API_KEY in .env at the repo root";
+      cb.parentElement.style.opacity = "0.5";
+    }
     $("#pipeCountry").addEventListener("input", updateCountryHint);
     updateCountryHint();
     $("#pipeRun").addEventListener("click", startPipeline);
@@ -1112,27 +1162,30 @@ async function renderPipeline() {
   await refreshPipeline();
 }
 
+function pipeCountries() {
+  return $("#pipeCountry").value.trim().toUpperCase().split(",")
+    .map((c) => c.trim()).filter(Boolean);
+}
+
 function updateCountryHint() {
-  const cc = $("#pipeCountry").value.trim().toUpperCase();
-  const known = (state.pipeline.configs?.countries || []).some((c) => c.country === cc);
-  const hint = $("#pipeCountryHint");
-  if (cc.length === 2 && !known) {
-    hint.textContent = `new country — a generic ${cc.toLowerCase()}.yaml config will be auto-generated (review its header notes after)`;
-  } else {
-    hint.textContent = "";
-  }
+  const known = new Set((state.pipeline.configs?.countries || []).map((c) => c.country));
+  const fresh = pipeCountries().filter((c) => c.length === 2 && !known.has(c));
+  $("#pipeCountryHint").textContent = fresh.length
+    ? `new: ${fresh.join(", ")} — generic configs will be auto-generated (review their header notes after)`
+    : "";
 }
 
 async function startPipeline() {
-  const country = $("#pipeCountry").value.trim().toUpperCase();
-  if (!/^[A-Z]{2}$/.test(country)) {
-    $("#pipeStatus").innerHTML = `<div class="empty">Enter a 2-letter ISO country code.</div>`;
+  const countries = pipeCountries();
+  if (!countries.length || countries.some((c) => !/^[A-Z]{2}$/.test(c))) {
+    $("#pipeStatus").innerHTML = `<div class="empty">Enter 2-letter ISO codes, comma-separated (e.g. IN,US).</div>`;
     return;
   }
   const skip = $("#pipeSkipDownload").value;
+  const exportDb = $("#pipeExportDb").checked ? "1" : "0";
   $("#pipeRun").disabled = true;
   try {
-    await api(`/api/pipeline/start?country=${encodeURIComponent(country)}&skip_download=${skip}`);
+    await api(`/api/pipeline/start?country=${encodeURIComponent(countries.join(","))}&skip_download=${skip}&export_db=${exportDb}`);
   } catch (err) {
     $("#pipeStatus").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
     $("#pipeRun").disabled = false;
@@ -1169,23 +1222,25 @@ function renderPipelineStatus(s) {
   const ok = finished && s.exit_code === 0;
   const stateTag = s.running ? tag("running", "review")
     : ok ? tag("done", "auto") : finished ? tag(`failed (exit ${s.exit_code})`, "risk") : tag("—");
+  const runIds = s.run_ids || (s.run_id ? [s.run_id] : []);
   box.innerHTML = `
     <div class="meta-grid">
-      <div class="meta-item"><div class="ml">Country</div><div class="mv">${esc(s.country)}</div></div>
+      <div class="meta-item"><div class="ml">Countries</div><div class="mv">${esc(s.country)}</div></div>
       <div class="meta-item"><div class="ml">Status</div><div class="mv">${stateTag}</div></div>
       <div class="meta-item"><div class="ml">Stage</div><div class="mv">${esc(s.stage || "starting…")}</div></div>
       <div class="meta-item"><div class="ml">Download</div><div class="mv">${s.skip_download ? "skipped" : "fresh"}</div></div>
     </div>
-    ${ok && s.run_id ? `<div style="margin-top:10px"><button class="btn primary" id="pipeSwitch">Open run ${esc(s.run_id)} →</button></div>` : ""}
+    ${runIds.length && !s.running ? `<div class="chip-row" style="margin-top:10px;gap:6px">
+      ${runIds.map((r) => `<button class="btn small pipe-open" data-run="${esc(r)}">Open ${esc(r)} →</button>`).join("")}
+    </div>` : ""}
   `;
   $("#pipeLog").textContent = (s.log_tail || []).join("\n");
   const logEl = $("#pipeLog");
   logEl.scrollTop = logEl.scrollHeight;
-  const sw = $("#pipeSwitch");
-  if (sw) sw.addEventListener("click", async () => {
-    await api(`/api/switch-run?run=${encodeURIComponent(s.run_id)}`);
+  $$(".pipe-open").forEach((b) => b.addEventListener("click", async () => {
+    await api(`/api/switch-run?run=${encodeURIComponent(b.dataset.run)}`);
     location.reload();
-  });
+  }));
 }
 
 /* ---------------- theme ---------------- */
@@ -1207,10 +1262,12 @@ async function boot() {
   $("#pageSub").textContent = `${ov.run_id} · ${ov.country} · ${ov.version} · ${fmt(ov.total_records)} records`;
   try {
     const { runs } = await api("/api/runs");
+    const latestByCountry = {};
+    runs.forEach((r) => { latestByCountry[r.country] = r.run_id; }); // runs sorted asc; last wins
     const sel = $("#runSwitch");
     sel.innerHTML = runs.map((r) => `
       <option value="${esc(r.run_id)}" ${r.current ? "selected" : ""}>
-        ${esc(r.country || "?")} · ${esc(r.run_id)} · ${esc(r.version)}
+        ${latestByCountry[r.country] === r.run_id ? "●" : "○"} ${esc(r.country || "?")} · ${esc(r.run_id)} · ${esc(r.version)}${r.records ? ` · ${compact(r.records)}` : ""}
       </option>`).join("");
     sel.addEventListener("change", async () => {
       sel.disabled = true;
