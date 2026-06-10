@@ -1,0 +1,24 @@
+# Country normalization lookups.
+#
+# numeric_code_map : provider numeric country codes -> ISO2.
+#                    (agoda uses '35' for India; extend as other feeds appear.)
+# name_map         : lowercased country_name -> ISO2 fallback when codes are absent.
+numeric_code_map:
+  "35": IN          # agoda India
+  "25": NZ          # agoda New Zealand
+  "181": US         # agoda United States
+
+name_map:
+  india: IN
+  bharat: IN
+  "republic of india": IN
+  united states: US
+  usa: US
+  "united states of america": US
+  "new zealand": NZ
+
+# Already-ISO2 values we accept as-is (uppercased).
+iso2_passthrough:
+  - IN
+  - US
+  - NZ

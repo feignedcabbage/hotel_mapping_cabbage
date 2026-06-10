@@ -1,0 +1,89 @@
+# Country-specific state/region canonicalization, keyed by run country (ISO2).
+# Lookup is exact-match on the lowercased state_clean value; the value is the
+# canonical lowercase form. Unmapped values pass through unchanged.
+#
+# US: full state names -> USPS 2-letter codes (codes themselves pass through
+# already-canonical). NZ: common region-name variants -> canonical region name.
+
+US:
+  alabama: al
+  alaska: ak
+  arizona: az
+  arkansas: ar
+  california: ca
+  colorado: co
+  connecticut: ct
+  delaware: de
+  florida: fl
+  georgia: ga
+  hawaii: hi
+  idaho: id
+  illinois: il
+  indiana: in
+  iowa: ia
+  kansas: ks
+  kentucky: ky
+  louisiana: la
+  maine: me
+  maryland: md
+  massachusetts: ma
+  michigan: mi
+  minnesota: mn
+  mississippi: ms
+  missouri: mo
+  montana: mt
+  nebraska: ne
+  nevada: nv
+  new hampshire: nh
+  new jersey: nj
+  new mexico: nm
+  new york: ny
+  north carolina: nc
+  north dakota: nd
+  ohio: oh
+  oklahoma: ok
+  oregon: or
+  pennsylvania: pa
+  rhode island: ri
+  south carolina: sc
+  south dakota: sd
+  tennessee: tn
+  texas: tx
+  utah: ut
+  vermont: vt
+  virginia: va
+  washington: wa
+  west virginia: wv
+  wisconsin: wi
+  wyoming: wy
+  district of columbia: dc
+  washington dc: dc
+  washington, d.c.: dc
+  puerto rico: pr
+  guam: gu
+  us virgin islands: vi
+  u.s. virgin islands: vi
+  american samoa: as
+  northern mariana islands: mp
+
+NZ:
+  auckland region: auckland
+  bay of plenty region: bay of plenty
+  canterbury region: canterbury
+  gisborne region: gisborne
+  hawke's bay region: hawke's bay
+  hawkes bay region: hawke's bay
+  hawkes bay: hawke's bay
+  manawatu-wanganui region: manawatu-wanganui
+  manawatuwanganui region: manawatu-wanganui
+  manawatuwanganui: manawatu-wanganui
+  marlborough region: marlborough
+  nelson region: nelson
+  northland region: northland
+  otago region: otago
+  southland region: southland
+  taranaki region: taranaki
+  tasman region: tasman
+  waikato region: waikato
+  wellington region: wellington
+  west coast region: west coast

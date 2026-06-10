@@ -1,0 +1,163 @@
+# Run config for the India (IN) subset.
+country: IN
+default_phone_region: IN
+
+paths:
+  # Directory containing {provider}_property_info.ndjson files for this country.
+  raw_dir: data/raw/IN
+  output_dir: data/artifacts/runs
+
+# Providers to ingest. gogobal IN file is empty, so it is omitted.
+providers:
+  - agoda
+  - cleartrip
+  - expedia
+  - grnc
+  - hotelbeds
+  - ioxl
+  - ratehawk
+  - restel
+  - rezlive
+  - tbo
+  - tripjack
+  - veturis
+
+geo:
+  h3_resolutions: [7, 8, 9]
+  geohash_precisions: [5, 6, 7]
+  # Coordinates outside these bounds are flagged out_of_range (not corrected).
+  # India bounding box (with a little slack); restel leaks some non-IN rows.
+  lat_min: 6.0
+  lat_max: 37.5
+  lng_min: 68.0
+  lng_max: 97.5
+  # decimal places below this => low precision flag
+  min_decimal_places: 3
+
+tokens:
+  min_token_length: 2
+  # A token appearing in >= this fraction of records is a low-value candidate.
+  # 764k rows * 0.005 ~= 3.8k records.
+  low_value_global_doc_freq_ratio: 0.005
+  low_value_min_city_coverage: 20
+  low_value_min_provider_coverage: 4
+  rare_global_max_doc_freq: 2
+  rare_global_min_length: 4
+  rare_city_min_doc_freq: 2
+  rare_city_max_doc_freq: 50
+  rare_city_min_length: 4
+  # how many rare city tokens to emit per city in the generated policy
+  rare_city_max_cities: 50
+  # generated brand-candidate review queue: min hotel_chain-field occurrences.
+  # (Candidates are NOT auto-applied; promote via manual_tokens.brand_tokens.)
+  brand_candidate_min_chain_count: 30
+  # property_name_blocking_tokens: drop tokens at/above this global doc-freq ratio
+  # (stricter than low_value 0.005) and shorter than blocking_min_token_length.
+  blocking_overcommon_ratio: 0.001
+  blocking_min_token_length: 4
+  # property_name_match_tokens: stricter identity tokens for name Jaccard/coherence.
+  match_global_overcommon_ratio: 0.01
+  match_city_overcommon_ratio: 0.02
+  match_city_overcommon_min_doc_freq: 20
+  match_city_overcommon_min_provider_coverage: 4
+  match_min_token_length: 4
+  match_area_identity_keep_max_doc_freq: 200
+
+# Manual overrides layered on top of the generated policy.
+manual_tokens:
+  force_low_value:
+    - hotel
+    - hotels
+    - room
+    - rooms
+    - stay
+    - stays
+    - the
+    - and
+  force_keep:
+    - sai
+  brand_tokens:
+    - oyo
+    - treebo
+    - fabhotel
+    - fabexpress
+    - fab
+    - novotel
+    - marriott
+    - taj
+    - lemon
+    - lemontree
+    - ginger
+    - itc
+    - radisson
+    - sarovar
+    - sterling
+    - clarks
+    - zostel
+    - goroomgo
+    - spot
+    - collection
+    - townhouse
+    - capital
+    - "o"
+  location_descriptors:
+    - airport
+    - railway
+    - station
+    - beach
+    - temple
+    - bus
+    - metro
+    - near
+    - opposite
+    - opp
+    - beside
+    - road
+    - market
+
+# Reuse thresholds for contact-signal diagnostics.
+reuse:
+  phone_reuse_min: 5
+  email_reuse_min: 5
+  domain_reuse_min: 20
+  top_n: 200
+
+generic_email_locals:
+  - info
+  - reservation
+  - reservations
+  - booking
+  - bookings
+  - sales
+  - contact
+  - frontoffice
+  - frontdesk
+  - enquiry
+  - enquiries
+  - admin
+  - support
+  - stay
+  - hotel
+
+# Domains that are OTA / aggregator / supplier — weak as identity signals.
+weak_domains:
+  - booking.com
+  - agoda.com
+  - expedia.com
+  - tboholidays.com
+  - goibibo.com
+  - makemytrip.com
+  - tripadvisor.com
+  - hotels.com
+  - airbnb.com
+  - cleartrip.com
+  - worldota.net
+  - grnconnect.com
+
+# Brand families: sub-brand tokens that are naming variants of the SAME
+# property (feeds swap/drop the prefix). Collapsed to one group before the
+# v2_3 brand-conflict test. OYO rebrands to/from Treebo etc. still conflict.
+brand_groups:
+  oyo: [oyo, capital, o, collection, townhouse, spot]
+  fab: [fab, fabhotel, fabexpress]
+  lemon: [lemon, lemontree]

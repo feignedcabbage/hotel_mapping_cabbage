@@ -1,0 +1,43 @@
+# Per-provider quirks. Keys are provider names.
+#
+# country_code_field : which raw column holds the usable country code.
+#                      Defaults to "country_code"; agoda/grnc need iso2.
+# country_code_map   : numeric/string raw country_code -> ISO2 (agoda uses '35').
+# property_type_map  : provider-specific coded property_type -> raw category that
+#                      property_type_maps.yaml understands (see that file).
+
+agoda:
+  country_code_field: country_code_iso2
+  country_code_map:
+    "35": IN
+
+grnc:
+  country_code_field: country_code_iso2
+
+hotelbeds:
+  # Hotelbeds GIATA type codes.
+  property_type_map:
+    H: hotel
+    A: apartment
+    W: apartment       # "W" seen on holiday-home / villa style stays
+    G: guesthouse
+    R: resort
+    B: guesthouse
+    H1: hotel
+    H2: hotel
+
+restel:
+  # Restel numeric type codes (best-effort v1; tune from data).
+  property_type_map:
+    "1": hotel
+    "2": hotel
+    "8": apartment
+
+expedia: {}
+ratehawk: {}
+cleartrip: {}
+ioxl: {}
+rezlive: {}
+tbo: {}
+tripjack: {}
+veturis: {}

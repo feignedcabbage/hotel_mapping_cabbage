@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HotelMap — mapping console</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="frame">
+    <aside class="sidebar">
+      <div class="logo-row">
+        <div class="logo-mark">◈</div>
+        <div class="logo-name">HotelMap</div>
+      </div>
+
+      <div class="nav-section">General</div>
+      <nav>
+        <button class="nav-item active" data-view="overview">
+          <span class="nico"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></svg></span>
+          Dashboard
+        </button>
+        <button class="nav-item" data-view="clusters">
+          <span class="nico"><svg viewBox="0 0 24 24"><circle cx="6.5" cy="6.5" r="3.5"/><circle cx="17.5" cy="6.5" r="3.5"/><circle cx="12" cy="17" r="3.5"/></svg></span>
+          Clusters
+        </button>
+        <button class="nav-item" data-view="cities">
+          <span class="nico"><svg viewBox="0 0 24 24"><path d="M12 21s-7-6.1-7-11a7 7 0 0 1 14 0c0 4.9-7 11-7 11z"/><circle cx="12" cy="10" r="2.6"/></svg></span>
+          Cities
+        </button>
+        <button class="nav-item" data-view="unmapped">
+          <span class="nico"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></span>
+          Unmapped
+          <span class="nav-badge" id="unmappedBadge"></span>
+        </button>
+        <button class="nav-item" data-view="reviews">
+          <span class="nico"><svg viewBox="0 0 24 24"><path d="M12 3l9 16H3z"/><path d="M12 10v4"/><circle cx="12" cy="17" r=".4"/></svg></span>
+          Review Queue
+          <span class="nav-badge" id="reviewBadge"></span>
+        </button>
+      </nav>
+
+      <div class="nav-section">Data</div>
+      <nav>
+        <button class="nav-item" data-view="providers">
+          <span class="nico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="2"/><rect x="3" y="14" width="18" height="6" rx="2"/><circle cx="7" cy="7" r=".5"/><circle cx="7" cy="17" r=".5"/></svg></span>
+          Providers
+        </button>
+      </nav>
+
+      <div class="sidebar-foot">
+        <div class="theme-toggle" id="themeToggle">
+          <button class="tt-btn" data-theme="light">☀ Light</button>
+          <button class="tt-btn active" data-theme="dark">☾ Dark</button>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="pageTitle">Welcome back</h1>
+          <div class="sub" id="pageSub">Loading run…</div>
+        </div>
+        <div class="topbar-right">
+          <span class="pill" id="guardPill"></span>
+          <select id="runSwitch" class="run-switch" title="Switch run / country"></select>
+          <div class="avatar">HM</div>
+        </div>
+      </header>
+
+      <section id="overview" class="view"></section>
+      <section id="clusters" class="view hidden"></section>
+      <section id="clusterDetail" class="view hidden"></section>
+      <section id="cities" class="view hidden"></section>
+      <section id="unmapped" class="view hidden"></section>
+      <section id="reviews" class="view hidden"></section>
+      <section id="providers" class="view hidden"></section>
+    </main>
+  </div>
+
+  <div id="overlay" class="overlay"></div>
+  <aside id="drawer" class="drawer" aria-hidden="true">
+    <div class="drawer-head">
+      <div>
+        <div id="drawerTitle" class="drawer-title"></div>
+        <div id="drawerSub" class="drawer-sub mono"></div>
+      </div>
+      <button id="drawerClose" class="drawer-close">✕</button>
+    </div>
+    <div id="drawerBody" class="drawer-body"></div>
+  </aside>
+
+  <script src="/app.js"></script>
+</body>
+</html>

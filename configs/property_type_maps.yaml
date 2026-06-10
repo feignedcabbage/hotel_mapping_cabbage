@@ -1,0 +1,23 @@
+# Coarse property-type categories. Free-text values are lowercased and matched by
+# substring against the keyword lists below (first match wins, in listed order).
+# Provider coded values are first translated via providers.yaml:property_type_map,
+# then fall through here.
+categories:
+  - unknown
+  - hotel
+  - apartment
+  - villa
+  - resort
+  - hostel
+  - guesthouse
+  - homestay
+
+# substring keywords -> category. Order matters: more specific first.
+keywords:
+  resort: [resort]
+  villa: [villa]
+  homestay: [homestay, home stay, "home-stay"]
+  guesthouse: [guest house, guesthouse, guest-house, lodge, inn, b&b, "bed and breakfast"]
+  hostel: [hostel, dormitory, backpacker]
+  apartment: [apartment, aparthotel, "apart hotel", serviced apartment, flat, condo, studio]
+  hotel: [hotel, motel]
